@@ -4,10 +4,7 @@ pub mod schema_id_util;
 
 use async_trait::async_trait;
 
-use crate::{
-    message::proto,
-    Error, Payload,
-};
+use crate::{message::proto, Error, Payload};
 
 /// Data returned from encoding a message with a PulsarSchema.
 #[derive(Debug, Clone)]

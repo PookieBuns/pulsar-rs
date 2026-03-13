@@ -46,9 +46,12 @@ fn split_kv_payload(payload: &Payload) -> Result<(Payload, Payload), Error> {
             "KeyValue payload too short to contain key length".to_string(),
         ));
     }
-    let key_len =
-        u32::from_be_bytes([payload.data[0], payload.data[1], payload.data[2], payload.data[3]])
-            as usize;
+    let key_len = u32::from_be_bytes([
+        payload.data[0],
+        payload.data[1],
+        payload.data[2],
+        payload.data[3],
+    ]) as usize;
     if payload.data.len() < 4 + key_len {
         return Err(Error::Custom(
             "KeyValue payload too short for declared key length".to_string(),
@@ -115,9 +118,7 @@ where
     ) -> Result<(K, V), Error> {
         let (key_id, value_id) = match schema_id {
             Some(data) => match schema_id_util::strip_magic_header(data)? {
-                Some(SchemaIdInfo::KeyValue { key_id, value_id }) => {
-                    (Some(key_id), Some(value_id))
-                }
+                Some(SchemaIdInfo::KeyValue { key_id, value_id }) => (Some(key_id), Some(value_id)),
                 Some(SchemaIdInfo::Single(_)) => {
                     return Err(Error::Custom(format!(
                         "KV decode received Single (0xFF) schema_id framing on topic \
@@ -225,12 +226,22 @@ mod tests {
 
         // Verify inner IDs are stored WITHOUT the 0xFF magic prefix (no double-framing).
         // The KV frame should contain raw inner IDs: [0xFE, key_len(4), 0x01, 0x02]
-        let info = schema_id_util::strip_magic_header(&framed).unwrap().unwrap();
+        let info = schema_id_util::strip_magic_header(&framed)
+            .unwrap()
+            .unwrap();
         match info {
             schema_id_util::SchemaIdInfo::KeyValue { key_id, value_id } => {
                 // Raw inner IDs — no 0xFF prefix
-                assert_eq!(key_id, vec![0x01], "key_id should be raw, without 0xFF prefix");
-                assert_eq!(value_id, vec![0x02], "value_id should be raw, without 0xFF prefix");
+                assert_eq!(
+                    key_id,
+                    vec![0x01],
+                    "key_id should be raw, without 0xFF prefix"
+                );
+                assert_eq!(
+                    value_id,
+                    vec![0x02],
+                    "value_id should be raw, without 0xFF prefix"
+                );
             }
             other => panic!("expected KeyValue, got {:?}", other),
         }
@@ -351,7 +362,10 @@ mod tests {
         let result = kv_schema
             .decode("topic", &payload, Some(&single_framed))
             .await;
-        assert!(result.is_err(), "KV decode with Single framing should error");
+        assert!(
+            result.is_err(),
+            "KV decode with Single framing should error"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("Single (0xFF)"),

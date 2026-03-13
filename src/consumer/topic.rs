@@ -138,40 +138,36 @@ impl<T: DeserializeMessage + Send + 'static, Exe: Executor> TopicConsumer<T, Exe
         // decoded channel. Otherwise, wrap the raw receiver directly — no extra
         // task or channel hop needed (I2 fix).
         let messages: MessageReceiver<T> = if let Some(schema) = schema {
-            let (decoded_tx, decoded_rx) =
-                mpsc::channel::<Result<(MessageIdData, Payload, Option<T>, Option<String>), Error>>(
-                    receiver_queue_size as usize,
-                );
+            let (decoded_tx, decoded_rx) = mpsc::channel::<
+                Result<(MessageIdData, Payload, Option<T>, Option<String>), Error>,
+            >(receiver_queue_size as usize);
             let decode_topic = topic.clone();
             let decode_task = client.executor.spawn(Box::pin(async move {
                 let mut raw_rx = rx;
                 let mut decoded_tx = decoded_tx;
                 while let Some(result) = raw_rx.next().await {
-                    let mapped = match result {
-                        Ok((id, payload)) => {
-                            let schema_id_bytes = payload.metadata.schema_id.clone();
-                            match schema
-                                .decode(
-                                    &decode_topic,
-                                    &payload,
-                                    schema_id_bytes.as_deref(),
-                                )
-                                .await
-                            {
-                                Ok(decoded) => Ok((id, payload, Some(decoded), None)),
-                                Err(e) => {
-                                    let err_msg = format!("{}", e);
-                                    log::warn!(
+                    let mapped =
+                        match result {
+                            Ok((id, payload)) => {
+                                let schema_id_bytes = payload.metadata.schema_id.clone();
+                                match schema
+                                    .decode(&decode_topic, &payload, schema_id_bytes.as_deref())
+                                    .await
+                                {
+                                    Ok(decoded) => Ok((id, payload, Some(decoded), None)),
+                                    Err(e) => {
+                                        let err_msg = format!("{}", e);
+                                        log::warn!(
                                         "schema decode failed for message {:?} on topic {}: {}. \
                                          Forwarding with decoded=None so it can be acked/nacked.",
                                         id, decode_topic, err_msg
                                     );
-                                    Ok((id, payload, None, Some(err_msg)))
+                                        Ok((id, payload, None, Some(err_msg)))
+                                    }
                                 }
                             }
-                        }
-                        Err(e) => Err(e),
-                    };
+                            Err(e) => Err(e),
+                        };
                     if decoded_tx.send(mapped).await.is_err() {
                         break;
                     }
@@ -390,7 +386,12 @@ impl<T: DeserializeMessage + Send + 'static, Exe: Executor> Stream for TopicCons
             Poll::Ready(Some(Ok((id, payload, decoded, decode_error)))) => {
                 self.last_message_received = Some(Utc::now());
                 self.messages_received += 1;
-                Poll::Ready(Some(Ok(self.create_message(id, payload, decoded, decode_error))))
+                Poll::Ready(Some(Ok(self.create_message(
+                    id,
+                    payload,
+                    decoded,
+                    decode_error,
+                ))))
             }
             Poll::Ready(Some(Err(e))) => {
                 error!("we are using in the single-consumer and we got an error, {e}");

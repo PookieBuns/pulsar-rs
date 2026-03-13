@@ -312,7 +312,9 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
 
     /// creates a [Consumer] from this builder
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub async fn build<T: DeserializeMessage + Send + 'static>(self) -> Result<Consumer<T, Exe>, Error> {
+    pub async fn build<T: DeserializeMessage + Send + 'static>(
+        self,
+    ) -> Result<Consumer<T, Exe>, Error> {
         // clone() is only used for validate(); schema_object is NOT cloneable.
         // Guard: if schema_info is set, schema_object must still be present on `self`.
         if self.schema_info.is_some() && self.schema_object.is_none() {
@@ -391,12 +393,17 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
             }
             InnerConsumer::Multi(consumer)
         };
-        Ok(Consumer { inner: consumer, schema })
+        Ok(Consumer {
+            inner: consumer,
+            schema,
+        })
     }
 
     /// creates a [Reader] from this builder
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub async fn into_reader<T: DeserializeMessage + Send + 'static>(self) -> Result<Reader<T, Exe>, Error> {
+    pub async fn into_reader<T: DeserializeMessage + Send + 'static>(
+        self,
+    ) -> Result<Reader<T, Exe>, Error> {
         if self.schema_info.is_some() && self.schema_object.is_none() {
             return Err(Error::Custom(
                 "schema_object lost — was into_reader() called on a cloned ConsumerBuilder? \
@@ -444,7 +451,8 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
         }
 
         let (topic, addr) = joined_topics.pop().unwrap();
-        let consumer = TopicConsumer::new(self.pulsar.clone(), topic, addr, config.clone(), schema).await?;
+        let consumer =
+            TopicConsumer::new(self.pulsar.clone(), topic, addr, config.clone(), schema).await?;
 
         Ok(Reader {
             consumer,

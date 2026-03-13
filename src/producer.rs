@@ -291,8 +291,8 @@ impl<Exe: Executor> MultiTopicProducer<Exe> {
 
         // If a PulsarSchema is attached, encode via it.
         if let Some(ref schema_obj) = self.schema_object {
-            if let Some(schema) = schema_obj
-                .downcast_ref::<Arc<dyn crate::schema::PulsarSchema<T>>>()
+            if let Some(schema) =
+                schema_obj.downcast_ref::<Arc<dyn crate::schema::PulsarSchema<T>>>()
             {
                 let encode_data = schema.encode(&topic, message).await?;
 
@@ -543,8 +543,8 @@ impl<Exe: Executor> Producer<Exe> {
     ) -> Result<SendFuture, Error> {
         // Try PulsarSchema<T> if available and the stored schema matches T.
         if let Some(ref schema_obj) = self.schema_object {
-            if let Some(schema) = schema_obj
-                .downcast_ref::<Arc<dyn crate::schema::PulsarSchema<T>>>()
+            if let Some(schema) =
+                schema_obj.downcast_ref::<Arc<dyn crate::schema::PulsarSchema<T>>>()
             {
                 let topic = self.topic().to_string();
                 let encode_data = schema.encode(&topic, message).await?;
@@ -1392,7 +1392,7 @@ enum BatchItem {
     SingleMessage(
         oneshot::Sender<Result<CommandSendReceipt, Error>>,
         BatchedMessage,
-        Option<Vec<u8>>,  // schema_id for PIP-420
+        Option<Vec<u8>>, // schema_id for PIP-420
     ),
     Flush(oneshot::Sender<()>),
 }
@@ -2086,13 +2086,11 @@ mod tests {
                 .await
                 .unwrap();
 
-            let schema: Arc<dyn crate::schema::PulsarSchema<String>> =
-                Arc::new(TestSchema { schema_id: Some(vec![1, 2, 3]) });
+            let schema: Arc<dyn crate::schema::PulsarSchema<String>> = Arc::new(TestSchema {
+                schema_id: Some(vec![1, 2, 3]),
+            });
 
-            let producer = pulsar
-                .producer()
-                .with_schema(schema)
-                .build_multi_topic();
+            let producer = pulsar.producer().with_schema(schema).build_multi_topic();
 
             // The schema should have been merged into options.
             assert!(
@@ -2118,10 +2116,7 @@ mod tests {
             let schema: Arc<dyn crate::schema::PulsarSchema<String>> =
                 Arc::new(TestSchema { schema_id: None });
 
-            let producer = pulsar
-                .producer()
-                .with_schema(schema)
-                .build_multi_topic();
+            let producer = pulsar.producer().with_schema(schema).build_multi_topic();
 
             assert!(
                 producer.schema_object.is_some(),
@@ -2199,13 +2194,11 @@ mod tests {
 
         let topic = format!("multi_topic_schema_{}", rand::random::<u16>());
 
-        let schema: Arc<dyn crate::schema::PulsarSchema<String>> =
-            Arc::new(TestSchema { schema_id: Some(vec![0, 1, 2, 3]) });
+        let schema: Arc<dyn crate::schema::PulsarSchema<String>> = Arc::new(TestSchema {
+            schema_id: Some(vec![0, 1, 2, 3]),
+        });
 
-        let mut producer = pulsar
-            .producer()
-            .with_schema(schema)
-            .build_multi_topic();
+        let mut producer = pulsar.producer().with_schema(schema).build_multi_topic();
 
         // send_schema_non_blocking should encode via PulsarSchema
         let _receipt = producer
@@ -2229,8 +2222,9 @@ mod tests {
         let partition_count = 3;
         test_utils::create_partitioned_topic("public", "default", &topic, partition_count).await;
 
-        let schema: Arc<dyn crate::schema::PulsarSchema<String>> =
-            Arc::new(TestSchema { schema_id: Some(vec![10, 20]) });
+        let schema: Arc<dyn crate::schema::PulsarSchema<String>> = Arc::new(TestSchema {
+            schema_id: Some(vec![10, 20]),
+        });
 
         // Build a single-topic producer (partitioned) with schema
         let mut producer = pulsar
@@ -2265,13 +2259,11 @@ mod tests {
         let partition_count = 3;
         test_utils::create_partitioned_topic("public", "default", &topic, partition_count).await;
 
-        let schema: Arc<dyn crate::schema::PulsarSchema<String>> =
-            Arc::new(TestSchema { schema_id: Some(vec![7, 8, 9]) });
+        let schema: Arc<dyn crate::schema::PulsarSchema<String>> = Arc::new(TestSchema {
+            schema_id: Some(vec![7, 8, 9]),
+        });
 
-        let mut producer = pulsar
-            .producer()
-            .with_schema(schema)
-            .build_multi_topic();
+        let mut producer = pulsar.producer().with_schema(schema).build_multi_topic();
 
         // send_schema_non_blocking to a partitioned topic
         for i in 0..6 {

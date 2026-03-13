@@ -118,10 +118,7 @@ mod tests {
         let original = TestMsg {
             data: "roundtrip".to_string(),
         };
-        let encoded = schema
-            .encode("test-topic", original.clone())
-            .await
-            .unwrap();
+        let encoded = schema.encode("test-topic", original.clone()).await.unwrap();
 
         let payload = Payload {
             metadata: proto::MessageMetadata::default(),

@@ -36,8 +36,7 @@ pub fn strip_magic_header(data: &[u8]) -> Result<Option<SchemaIdInfo>, crate::Er
                     data.len()
                 )));
             }
-            let key_len =
-                u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
+            let key_len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
             if data.len() < 5 + key_len {
                 return Err(crate::Error::Custom(format!(
                     "corrupt KV schema_id: key_len={} but only {} bytes remain",

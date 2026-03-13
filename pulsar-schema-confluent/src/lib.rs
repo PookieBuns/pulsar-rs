@@ -57,8 +57,7 @@ pub struct ConfluentJsonSchema<T> {
 impl<T> ConfluentJsonSchema<T> {
     pub fn new(config: ConfluentConfig, is_key: bool) -> Result<Self, Error> {
         let sr_settings = if config.auth.is_some() || config.timeout.is_some() {
-            let mut builder: SrSettingsBuilder =
-                SrSettings::new_builder(config.registry_url);
+            let mut builder: SrSettingsBuilder = SrSettings::new_builder(config.registry_url);
             if let Some(auth) = config.auth {
                 match auth {
                     ConfluentAuth::Basic { username, password } => {
@@ -72,9 +71,9 @@ impl<T> ConfluentJsonSchema<T> {
             if let Some(timeout) = config.timeout {
                 builder.set_timeout(timeout);
             }
-            builder.build().map_err(|e| {
-                Error::SchemaRegistry(format!("Failed to build SrSettings: {}", e))
-            })?
+            builder
+                .build()
+                .map_err(|e| Error::SchemaRegistry(format!("Failed to build SrSettings: {}", e)))?
         } else {
             SrSettings::new(config.registry_url)
         };
@@ -114,8 +113,8 @@ where
     }
 
     async fn encode(&self, topic: &str, message: T) -> Result<EncodeData, Error> {
-        let json_bytes = serde_json::to_vec(&message)
-            .map_err(|e| Error::SchemaRegistry(e.to_string()))?;
+        let json_bytes =
+            serde_json::to_vec(&message).map_err(|e| Error::SchemaRegistry(e.to_string()))?;
 
         // Schema registration and ID retrieval is not yet implemented.
         // A future iteration will wire the schema_registry_converter encode API
@@ -156,8 +155,7 @@ where
                 id.len()
             );
         }
-        serde_json::from_slice(&payload.data)
-            .map_err(|e| Error::SchemaRegistry(e.to_string()))
+        serde_json::from_slice(&payload.data).map_err(|e| Error::SchemaRegistry(e.to_string()))
     }
 }
 
@@ -321,6 +319,9 @@ mod tests {
         );
         let id = encode_data.schema_id.unwrap();
         assert!(id.len() >= 2, "schema_id too short");
-        assert_eq!(id[0], 0xFF, "schema_id must start with Pulsar magic byte 0xFF");
+        assert_eq!(
+            id[0], 0xFF,
+            "schema_id must start with Pulsar magic byte 0xFF"
+        );
     }
 }
