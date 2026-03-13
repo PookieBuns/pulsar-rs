@@ -56,10 +56,10 @@ impl<Exe: Executor> Clone for ConsumerBuilder<Exe> {
             dead_letter_policy: self.dead_letter_policy.clone(),
             namespace: self.namespace.clone(),
             topic_refresh: self.topic_refresh,
-            schema_info: self.schema_info.clone(),
-            // schema_object cannot be cloned (Box<dyn Any>). The original builder
-            // retains it; clones are only valid for validate(). build() and
-            // into_reader() assert the original's schema_object is intact.
+            // schema_object cannot be cloned (Box<dyn Any>). Clear schema_info
+            // too so that a clone never negotiates an External schema it cannot
+            // decode. Clones are only used for validate().
+            schema_info: None,
             schema_object: None,
         }
     }
@@ -315,10 +315,13 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
     pub async fn build<T: DeserializeMessage + Send + 'static>(self) -> Result<Consumer<T, Exe>, Error> {
         // clone() is only used for validate(); schema_object is NOT cloneable.
         // Guard: if schema_info is set, schema_object must still be present on `self`.
-        debug_assert!(
-            self.schema_info.is_none() || self.schema_object.is_some(),
-            "BUG: schema_info present but schema_object lost (was build() called on a clone?)"
-        );
+        if self.schema_info.is_some() && self.schema_object.is_none() {
+            return Err(Error::Custom(
+                "schema_object lost — was build() called on a cloned ConsumerBuilder? \
+                 Only the original builder retains the schema."
+                    .to_string(),
+            ));
+        }
         let (config, joined_topics) = self.clone().validate().await?;
 
         // Apply schema_info to options if set (takes precedence over .with_options())
@@ -394,10 +397,13 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
     /// creates a [Reader] from this builder
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn into_reader<T: DeserializeMessage + Send + 'static>(self) -> Result<Reader<T, Exe>, Error> {
-        debug_assert!(
-            self.schema_info.is_none() || self.schema_object.is_some(),
-            "BUG: schema_info present but schema_object lost (was into_reader() called on a clone?)"
-        );
+        if self.schema_info.is_some() && self.schema_object.is_none() {
+            return Err(Error::Custom(
+                "schema_object lost — was into_reader() called on a cloned ConsumerBuilder? \
+                 Only the original builder retains the schema."
+                    .to_string(),
+            ));
+        }
         let (mut config, mut joined_topics) = self.clone().validate().await?;
 
         if let Some(ref info) = self.schema_info {

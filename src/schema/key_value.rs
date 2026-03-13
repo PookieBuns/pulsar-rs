@@ -106,7 +106,15 @@ where
                 Some(SchemaIdInfo::KeyValue { key_id, value_id }) => {
                     (Some(key_id), Some(value_id))
                 }
-                _ => (None, None),
+                Some(SchemaIdInfo::Single(_)) => {
+                    log::warn!(
+                        "KV decode received Single schema_id framing on topic {} — \
+                         possible protocol/configuration mismatch; falling back to no schema IDs",
+                        topic
+                    );
+                    (None, None)
+                }
+                None => (None, None),
             },
             None => (None, None),
         };

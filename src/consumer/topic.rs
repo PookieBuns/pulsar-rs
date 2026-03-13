@@ -139,7 +139,7 @@ impl<T: DeserializeMessage + Send + 'static, Exe: Executor> TopicConsumer<T, Exe
         // task or channel hop needed (I2 fix).
         let messages: MessageReceiver<T> = if let Some(schema) = schema {
             let (decoded_tx, decoded_rx) =
-                mpsc::channel::<Result<(MessageIdData, Payload, Option<T>), Error>>(
+                mpsc::channel::<Result<(MessageIdData, Payload, Option<T>, Option<String>), Error>>(
                     receiver_queue_size as usize,
                 );
             let decode_topic = topic.clone();
@@ -158,14 +158,15 @@ impl<T: DeserializeMessage + Send + 'static, Exe: Executor> TopicConsumer<T, Exe
                                 )
                                 .await
                             {
-                                Ok(decoded) => Ok((id, payload, Some(decoded))),
+                                Ok(decoded) => Ok((id, payload, Some(decoded), None)),
                                 Err(e) => {
+                                    let err_msg = format!("{}", e);
                                     log::warn!(
                                         "schema decode failed for message {:?} on topic {}: {}. \
                                          Forwarding with decoded=None so it can be acked/nacked.",
-                                        id, decode_topic, e
+                                        id, decode_topic, err_msg
                                     );
-                                    Ok((id, payload, None))
+                                    Ok((id, payload, None, Some(err_msg)))
                                 }
                             }
                         }
@@ -353,6 +354,7 @@ impl<T: DeserializeMessage + Send + 'static, Exe: Executor> TopicConsumer<T, Exe
         message_id: MessageIdData,
         payload: Payload,
         decoded: Option<T>,
+        decode_error: Option<String>,
     ) -> Message<T> {
         Message {
             topic: self.topic.clone(),
@@ -362,6 +364,7 @@ impl<T: DeserializeMessage + Send + 'static, Exe: Executor> TopicConsumer<T, Exe
             },
             payload,
             decoded,
+            decode_error,
         }
     }
 
@@ -384,10 +387,10 @@ impl<T: DeserializeMessage + Send + 'static, Exe: Executor> Stream for TopicCons
         match self.messages.as_mut().poll_next(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(None),
-            Poll::Ready(Some(Ok((id, payload, decoded)))) => {
+            Poll::Ready(Some(Ok((id, payload, decoded, decode_error)))) => {
                 self.last_message_received = Some(Utc::now());
                 self.messages_received += 1;
-                Poll::Ready(Some(Ok(self.create_message(id, payload, decoded))))
+                Poll::Ready(Some(Ok(self.create_message(id, payload, decoded, decode_error))))
             }
             Poll::Ready(Some(Err(e))) => {
                 error!("we are using in the single-consumer and we got an error, {e}");

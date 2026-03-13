@@ -17,8 +17,9 @@ use crate::{
 
 pub type MessageIdDataReceiver = mpsc::Receiver<Result<(MessageIdData, Payload), Error>>;
 
+/// (message_id, payload, decoded_value, decode_error_description)
 pub type DecodedMessageReceiver<T> =
-    mpsc::Receiver<Result<(MessageIdData, Payload, Option<T>), Error>>;
+    mpsc::Receiver<Result<(MessageIdData, Payload, Option<T>, Option<String>), Error>>;
 
 /// Unified receiver that avoids spawning a pass-through task when no schema is
 /// attached. When polling, `Raw` maps `(id, payload)` → `(id, payload, None)`
@@ -31,7 +32,7 @@ pub enum MessageReceiver<T> {
 }
 
 impl<T> Stream for MessageReceiver<T> {
-    type Item = Result<(MessageIdData, Payload, Option<T>), Error>;
+    type Item = Result<(MessageIdData, Payload, Option<T>, Option<String>), Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // SAFETY: we only access the inner receivers which are Unpin (mpsc::Receiver).
@@ -41,7 +42,7 @@ impl<T> Stream for MessageReceiver<T> {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(None) => Poll::Ready(None),
                 Poll::Ready(Some(result)) => {
-                    Poll::Ready(Some(result.map(|(id, payload)| (id, payload, None))))
+                    Poll::Ready(Some(result.map(|(id, payload)| (id, payload, None, None))))
                 }
             },
             MessageReceiver::Decoded(rx) => Pin::new(rx).poll_next(cx),

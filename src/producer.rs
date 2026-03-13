@@ -1102,9 +1102,10 @@ impl<Exe: Executor> Clone for ProducerBuilder<Exe> {
             topic: self.topic.clone(),
             name: self.name.clone(),
             producer_options: self.producer_options.clone(),
-            schema_info: self.schema_info.clone(),
-            // schema_object cannot be cloned (Box<dyn Any>). The original builder
-            // retains it; clones are only valid for non-schema paths.
+            // schema_object cannot be cloned (Box<dyn Any>). Clear schema_info
+            // too so that a clone never negotiates an External schema it cannot
+            // encode. Clones are only used for non-schema paths.
+            schema_info: None,
             schema_object: None,
         }
     }
@@ -1147,7 +1148,7 @@ impl<Exe: Executor> ProducerBuilder<Exe> {
 
     /// Attach an external schema to this producer.
     /// The schema is type-erased internally; it is downcast back to
-    /// `PulsarSchema<T>` when `send_non_blocking()` is called.
+    /// `PulsarSchema<T>` when [`send_schema_non_blocking()`](Producer::send_schema_non_blocking) is called.
     pub fn with_schema<T: Send + 'static>(
         mut self,
         schema: Arc<dyn crate::schema::PulsarSchema<T>>,
@@ -1160,6 +1161,13 @@ impl<Exe: Executor> ProducerBuilder<Exe> {
     /// creates a new producer
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn build(self) -> Result<Producer<Exe>, Error> {
+        if self.schema_info.is_some() && self.schema_object.is_none() {
+            return Err(Error::Custom(
+                "schema_object lost — was build() called on a cloned ProducerBuilder? \
+                 Only the original builder retains the schema."
+                    .to_string(),
+            ));
+        }
         let ProducerBuilder {
             pulsar,
             topic,
