@@ -1,4 +1,5 @@
 pub mod default;
+pub mod key_value;
 pub mod schema_id_util;
 
 use async_trait::async_trait;
