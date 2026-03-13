@@ -53,3 +53,8 @@ pub trait PulsarSchema<T: Send>: Send + Sync + 'static {
         Ok(())
     }
 }
+
+// Re-exports
+pub use default::DefaultPulsarSchema;
+pub use key_value::KeyValueSchema;
+pub use schema_id_util::SchemaIdInfo;

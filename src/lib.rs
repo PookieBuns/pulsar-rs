@@ -210,6 +210,7 @@ pub use message::{
     Payload,
 };
 pub use producer::{MultiTopicProducer, Producer, ProducerOptions};
+pub use schema::{EncodeData, PulsarSchema};
 
 pub mod authentication;
 mod client;
