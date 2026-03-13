@@ -322,10 +322,21 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
 
         // Downcast schema_object: Box<dyn Any> wrapping Arc<dyn PulsarSchema<T>>
         let schema: Option<Arc<dyn crate::schema::PulsarSchema<T>>> =
-            self.schema_object.as_ref().and_then(|obj| {
-                obj.downcast_ref::<Arc<dyn crate::schema::PulsarSchema<T>>>()
-                    .cloned()
-            });
+            if let Some(ref obj) = self.schema_object {
+                Some(
+                    obj.downcast_ref::<Arc<dyn crate::schema::PulsarSchema<T>>>()
+                        .cloned()
+                        .ok_or_else(|| {
+                            Error::Custom(format!(
+                                "Schema type mismatch: with_schema() was called with a different \
+                                 type parameter than build::<{}>()",
+                                std::any::type_name::<T>()
+                            ))
+                        })?,
+                )
+            } else {
+                None
+            };
 
         let consumers = try_join_all(joined_topics.into_iter().map(|(topic, addr)| {
             let schema = schema.clone();
@@ -359,6 +370,7 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
                 new_consumers: None,
                 refresh,
                 config,
+                schema: schema.clone(),
                 disc_last_message_received: None,
                 disc_messages_received: 0,
             };
@@ -369,7 +381,7 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
             }
             InnerConsumer::Multi(consumer)
         };
-        Ok(Consumer { inner: consumer })
+        Ok(Consumer { inner: consumer, schema })
     }
 
     /// creates a [Reader] from this builder
@@ -384,10 +396,21 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
 
         // Downcast schema (same pattern as build())
         let schema: Option<Arc<dyn crate::schema::PulsarSchema<T>>> =
-            self.schema_object.as_ref().and_then(|obj| {
-                obj.downcast_ref::<Arc<dyn crate::schema::PulsarSchema<T>>>()
-                    .cloned()
-            });
+            if let Some(ref obj) = self.schema_object {
+                Some(
+                    obj.downcast_ref::<Arc<dyn crate::schema::PulsarSchema<T>>>()
+                        .cloned()
+                        .ok_or_else(|| {
+                            Error::Custom(format!(
+                                "Schema type mismatch: with_schema() was called with a different \
+                                 type parameter than into_reader::<{}>()",
+                                std::any::type_name::<T>()
+                            ))
+                        })?,
+                )
+            } else {
+                None
+            };
 
         // Internally, the reader interface is implemented as a consumer using an exclusive,
         // non-durable subscription

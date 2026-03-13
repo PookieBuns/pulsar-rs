@@ -35,6 +35,8 @@ pub struct MultiTopicConsumer<T: DeserializeMessage + Send, Exe: Executor> {
     >,
     pub(super) refresh: Pin<Box<dyn Stream<Item = ()> + Send + Sync>>,
     pub(super) config: ConsumerConfig,
+    /// Retained schema for re-creating TopicConsumers on topic refresh.
+    pub(super) schema: Option<std::sync::Arc<dyn crate::schema::PulsarSchema<T>>>,
     // Stats on disconnected consumers to keep metrics correct
     pub(super) disc_messages_received: u64,
     pub(super) disc_last_message_received: Option<DateTime<Utc>>,
@@ -148,6 +150,7 @@ impl<T: DeserializeMessage + Send + 'static, Exe: Executor> MultiTopicConsumer<T
         let pulsar = self.pulsar.clone();
         let topic_regex = self.topic_regex.clone();
         let namespace = self.namespace.clone();
+        let schema = self.schema.clone();
 
         // 1. get topics
         // 1.1 original topics from builder
@@ -190,7 +193,13 @@ impl<T: DeserializeMessage + Send + 'static, Exe: Executor> MultiTopicConsumer<T
                     .into_iter()
                     .filter(|(t, _)| !existing_topics.contains(t))
                     .map(|(topic, addr)| {
-                        TopicConsumer::new(pulsar.clone(), topic, addr, consumer_config.clone(), None)
+                        TopicConsumer::new(
+                            pulsar.clone(),
+                            topic,
+                            addr,
+                            consumer_config.clone(),
+                            schema.clone(),
+                        )
                     }),
             )
             .await?;

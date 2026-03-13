@@ -449,7 +449,7 @@ impl<Exe: Executor> Producer<Exe> {
     /// When a schema has been registered via [`ProducerBuilder::with_schema`],
     /// this method calls `PulsarSchema::encode` to obtain the payload and the
     /// registry `schema_id` before sending.  If the attached schema's type
-    /// parameter does not match `T`, this falls back to `SerializeMessage`.
+    /// parameter does not match `T`, an error is returned.
     ///
     /// Use this method (instead of [`send_non_blocking`]) when you want
     /// schema-aware encoding for messages produced with an external schema
@@ -461,6 +461,7 @@ impl<Exe: Executor> Producer<Exe> {
     pub async fn send_schema_non_blocking<T: SerializeMessage + Sized + Send + 'static>(
         &mut self,
         message: T,
+        message_metadata: Option<Message>,
     ) -> Result<SendFuture, Error> {
         // Try PulsarSchema<T> if available and the stored schema matches T.
         if let Some(ref schema_obj) = self.schema_object {
@@ -470,10 +471,16 @@ impl<Exe: Executor> Producer<Exe> {
                 let topic = self.topic().to_string();
                 let encode_data = schema.encode(&topic, message).await?;
 
-                let serialized_message = Message {
-                    payload: encode_data.payload,
-                    schema_id: encode_data.schema_id,
-                    ..Default::default()
+                let serialized_message = if let Some(mut msg) = message_metadata {
+                    msg.payload = encode_data.payload;
+                    msg.schema_id = encode_data.schema_id;
+                    msg
+                } else {
+                    Message {
+                        payload: encode_data.payload,
+                        schema_id: encode_data.schema_id,
+                        ..Default::default()
+                    }
                 };
 
                 return match &mut self.inner {
@@ -485,9 +492,15 @@ impl<Exe: Executor> Producer<Exe> {
                     }
                 };
             }
+            // Schema was attached but downcast failed — type mismatch error.
+            return Err(Error::Custom(format!(
+                "Schema type mismatch: ProducerBuilder::with_schema() was called with a different \
+                 type parameter than send_schema_non_blocking::<{}>()",
+                std::any::type_name::<T>()
+            )));
         }
 
-        // Fallback: use SerializeMessage (no schema attached or type mismatch).
+        // No schema attached: use SerializeMessage.
         let serialized_message = T::serialize_message(message)?;
         match &mut self.inner {
             ProducerInner::Single(p) => p.send(serialized_message).await,

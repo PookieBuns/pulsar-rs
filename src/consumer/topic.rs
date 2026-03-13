@@ -158,7 +158,14 @@ impl<T: DeserializeMessage + Send + 'static, Exe: Executor> TopicConsumer<T, Exe
                                 .await
                             {
                                 Ok(decoded) => Ok((id, payload, Some(decoded))),
-                                Err(e) => Err(e),
+                                Err(e) => {
+                                    log::warn!(
+                                        "schema decode failed for message {:?} on topic {}: {}. \
+                                         Forwarding with decoded=None so it can be acked/nacked.",
+                                        id, decode_topic, e
+                                    );
+                                    Ok((id, payload, None))
+                                }
                             }
                         }
                         Err(e) => Err(e),

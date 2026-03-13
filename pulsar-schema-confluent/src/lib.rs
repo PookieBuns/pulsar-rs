@@ -52,7 +52,7 @@ pub struct ConfluentJsonSchema<T> {
 }
 
 impl<T> ConfluentJsonSchema<T> {
-    pub fn new(config: ConfluentConfig, is_key: bool) -> Self {
+    pub fn new(config: ConfluentConfig, is_key: bool) -> Result<Self, Error> {
         let sr_settings = if config.auth.is_some() || config.timeout.is_some() {
             let mut builder: SrSettingsBuilder =
                 SrSettings::new_builder(config.registry_url);
@@ -69,17 +69,19 @@ impl<T> ConfluentJsonSchema<T> {
             if let Some(timeout) = config.timeout {
                 builder.set_timeout(timeout);
             }
-            builder.build().expect("Failed to build SrSettings")
+            builder.build().map_err(|e| {
+                Error::SchemaRegistry(format!("Failed to build SrSettings: {}", e))
+            })?
         } else {
             SrSettings::new(config.registry_url)
         };
 
-        Self {
+        Ok(Self {
             sr_settings,
             subject_strategy: config.subject_name_strategy,
             is_key,
             _phantom: PhantomData,
-        }
+        })
     }
 
     fn subject_name(&self, topic: &str) -> String {
@@ -152,7 +154,7 @@ pub struct ConfluentSchemaFactory;
 impl ConfluentSchemaFactory {
     pub fn json<T: Serialize + DeserializeOwned + Send + Sync + 'static>(
         config: ConfluentConfig,
-    ) -> ConfluentJsonSchema<T> {
+    ) -> Result<ConfluentJsonSchema<T>, Error> {
         ConfluentJsonSchema::new(config, false)
     }
 
@@ -191,7 +193,8 @@ mod tests {
                 timeout: None,
             },
             false,
-        );
+        )
+        .expect("schema creation failed");
         assert_eq!(schema.subject_name("my-topic"), "my-topic-value");
     }
 
@@ -205,7 +208,8 @@ mod tests {
                 timeout: None,
             },
             true,
-        );
+        )
+        .expect("schema creation failed");
         assert_eq!(schema.subject_name("my-topic"), "my-topic-key");
     }
 
@@ -219,7 +223,8 @@ mod tests {
                 timeout: None,
             },
             false,
-        );
+        )
+        .expect("schema creation failed");
         let info = schema.schema_info();
         assert_eq!(info.r#type, 22);
     }
@@ -231,7 +236,8 @@ mod tests {
             auth: None,
             subject_name_strategy: SubjectNameStrategy::TopicName,
             timeout: None,
-        });
+        })
+        .expect("factory json failed");
     }
 
     #[tokio::test]
@@ -244,7 +250,8 @@ mod tests {
                 timeout: None,
             },
             false,
-        );
+        )
+        .expect("schema creation failed");
 
         let original = TestEvent {
             name: "round-trip".to_string(),
@@ -284,7 +291,8 @@ mod tests {
                 timeout: None,
             },
             false,
-        );
+        )
+        .expect("schema creation failed");
         let event = TestEvent {
             name: "test".to_string(),
             value: 42,

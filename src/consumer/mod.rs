@@ -81,6 +81,8 @@ enum InnerConsumer<T: DeserializeMessage + Send, Exe: Executor> {
 /// ```
 pub struct Consumer<T: DeserializeMessage + Send, Exe: Executor> {
     inner: InnerConsumer<T, Exe>,
+    /// Retained schema for re-creating TopicConsumers on seek/reconnect.
+    schema: Option<std::sync::Arc<dyn crate::schema::PulsarSchema<T>>>,
 }
 
 impl<T: DeserializeMessage + Send + 'static, Exe: Executor> Consumer<T, Exe> {
@@ -195,7 +197,9 @@ impl<T: DeserializeMessage + Send + 'static, Exe: Executor> Consumer<T, Exe> {
                 let topic = c.topic().to_string();
                 let addr = client.lookup_topic(&topic).await?;
                 let config = c.config().clone();
-                InnerConsumer::Single(TopicConsumer::new(client, topic, addr, config, None).await?)
+                InnerConsumer::Single(
+                    TopicConsumer::new(client, topic, addr, config, self.schema.clone()).await?,
+                )
             }
             InnerConsumer::Multi(c) => {
                 c.seek(consumer_ids, message_id, timestamp).await?;
@@ -207,10 +211,17 @@ impl<T: DeserializeMessage + Send + 'static, Exe: Executor> Consumer<T, Exe> {
                     try_join_all(topics.into_iter().map(|topic| client.lookup_topic(topic)))
                         .await?;
 
+                let schema = self.schema.clone();
                 let topic_addr_pair = c.topics.iter().cloned().zip(addrs.iter().cloned());
 
                 let consumers = try_join_all(topic_addr_pair.map(|(topic, addr)| {
-                    TopicConsumer::new(client.clone(), topic, addr, config.clone(), None)
+                    TopicConsumer::new(
+                        client.clone(),
+                        topic,
+                        addr,
+                        config.clone(),
+                        schema.clone(),
+                    )
                 }))
                 .await?;
 
@@ -235,6 +246,7 @@ impl<T: DeserializeMessage + Send + 'static, Exe: Executor> Consumer<T, Exe> {
                     new_consumers: None,
                     refresh,
                     config,
+                    schema: self.schema.clone(),
                     disc_last_message_received: None,
                     disc_messages_received: 0,
                 })
