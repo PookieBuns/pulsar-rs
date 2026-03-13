@@ -160,7 +160,7 @@ mod tests {
         assert_eq!(
             info,
             SchemaIdInfo::KeyValue {
-                key_id: key_id,
+                key_id,
                 value_id: val_id,
             }
         );

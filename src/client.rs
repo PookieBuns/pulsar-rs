@@ -598,7 +598,13 @@ async fn run_producer<Exe: Executor>(
     client: Pulsar<Exe>,
     mut messages: mpsc::UnboundedReceiver<SendMessage>,
 ) {
-    let mut producer = client.producer().build_multi_topic();
+    let mut producer = match client.producer().build_multi_topic() {
+        Ok(p) => p,
+        Err(e) => {
+            error!("failed to build multi-topic producer: {e}");
+            return;
+        }
+    };
     while let Some(SendMessage {
         topic,
         message: payload,

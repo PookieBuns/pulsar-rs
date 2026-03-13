@@ -202,7 +202,7 @@ impl ProducerOptions {
 /// # let topic = "topic";
 /// # let message = "data".to_owned();
 /// let pulsar: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await?;
-/// let mut producer = pulsar.producer().with_name("name").build_multi_topic();
+/// let mut producer = pulsar.producer().with_name("name").build_multi_topic()?;
 /// let send_1 = producer.send_non_blocking(topic, &message).await?;
 /// let send_2 = producer.send_non_blocking(topic, &message).await?;
 /// send_1.await?;
@@ -215,6 +215,11 @@ pub struct MultiTopicProducer<Exe: Executor> {
     producers: BTreeMap<String, Producer<Exe>>,
     options: ProducerOptions,
     name: Option<String>,
+    /// Type-erased schema object, moved from `ProducerBuilder::with_schema`.
+    /// Used by [`send_schema_non_blocking`](Self::send_schema_non_blocking) to
+    /// encode messages at the multi-topic level before delegating to per-topic
+    /// producers.
+    schema_object: Option<Box<dyn Any + Send + Sync>>,
 }
 
 impl<Exe: Executor> MultiTopicProducer<Exe> {
@@ -263,7 +268,71 @@ impl<Exe: Executor> MultiTopicProducer<Exe> {
     ) -> Result<SendFuture, Error> {
         let message = T::serialize_message(message)?;
         let topic = topic.into();
-        let producer = match self.producers.entry(topic) {
+        let producer = self.get_or_create_producer(&topic).await?;
+        producer.send_non_blocking(message).await
+    }
+
+    /// Sends a message on a topic using the attached PulsarSchema (PIP-420).
+    ///
+    /// When a schema has been registered via
+    /// [`ProducerBuilder::with_schema`], this method calls
+    /// `PulsarSchema::encode` to obtain the payload and the registry
+    /// `schema_id`, then delegates the pre-encoded [`Message`] to the
+    /// per-topic producer.
+    ///
+    /// If no schema is attached, falls back to [`SerializeMessage`].
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn send_schema_non_blocking<
+        T: SerializeMessage + Sized + Send + 'static,
+        S: Into<String>,
+    >(
+        &mut self,
+        topic: S,
+        message: T,
+        message_metadata: Option<Message>,
+    ) -> Result<SendFuture, Error> {
+        let topic = topic.into();
+
+        // If a PulsarSchema is attached, encode via it.
+        if let Some(ref schema_obj) = self.schema_object {
+            if let Some(schema) = schema_obj
+                .downcast_ref::<Arc<dyn crate::schema::PulsarSchema<T>>>()
+            {
+                let encode_data = schema.encode(&topic, message).await?;
+
+                let serialized_message = if let Some(mut msg) = message_metadata {
+                    msg.payload = encode_data.payload;
+                    msg.schema_id = encode_data.schema_id;
+                    msg
+                } else {
+                    Message {
+                        payload: encode_data.payload,
+                        schema_id: encode_data.schema_id,
+                        ..Default::default()
+                    }
+                };
+
+                let producer = self.get_or_create_producer(&topic).await?;
+                return producer.send_non_blocking(serialized_message).await;
+            }
+            // Downcast failed — type mismatch.
+            return Err(Error::Custom(format!(
+                "Schema type mismatch: ProducerBuilder::with_schema() was called with a different \
+                 type parameter than send_schema_non_blocking::<{}>()",
+                std::any::type_name::<T>()
+            )));
+        }
+
+        // No schema attached: fall back to SerializeMessage.
+        let serialized_message = T::serialize_message(message)?;
+        let producer = self.get_or_create_producer(&topic).await?;
+        producer.send_non_blocking(serialized_message).await
+    }
+
+    /// Get or lazily create a per-topic producer.
+    async fn get_or_create_producer(&mut self, topic: &str) -> Result<&mut Producer<Exe>, Error> {
+        // Use the entry API. We need the topic as owned String for the key.
+        match self.producers.entry(topic.to_string()) {
             Entry::Vacant(entry) => {
                 let mut builder = self
                     .client
@@ -274,12 +343,10 @@ impl<Exe: Executor> MultiTopicProducer<Exe> {
                     builder = builder.with_name(name);
                 }
                 let producer = builder.build().await?;
-                entry.insert(producer)
+                Ok(entry.insert(producer))
             }
-            Entry::Occupied(entry) => entry.into_mut(),
-        };
-
-        producer.send_non_blocking(message).await
+            Entry::Occupied(entry) => Ok(entry.into_mut()),
+        }
     }
 
     /// sends a list of messages on a topic
@@ -1225,14 +1292,33 @@ impl<Exe: Executor> ProducerBuilder<Exe> {
     }
 
     /// creates a new [MultiTopicProducer]
+    ///
+    /// If [`with_schema`](Self::with_schema) was called, the schema is carried
+    /// into the multi-topic producer so that:
+    /// 1. `options.schema` is set — lazily-created per-topic producers negotiate
+    ///    the schema with the broker.
+    /// 2. [`MultiTopicProducer::send_schema_non_blocking`] can encode via the
+    ///    attached `PulsarSchema`.
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub fn build_multi_topic(self) -> MultiTopicProducer<Exe> {
-        MultiTopicProducer {
+    pub fn build_multi_topic(self) -> Result<MultiTopicProducer<Exe>, Error> {
+        if self.schema_info.is_some() && self.schema_object.is_none() {
+            return Err(Error::Custom(
+                "schema_object lost — was build_multi_topic() called on a cloned \
+                 ProducerBuilder? Only the original builder retains the schema."
+                    .to_string(),
+            ));
+        }
+        let mut options = self.producer_options.unwrap_or_default();
+        if let Some(info) = self.schema_info {
+            options.schema = Some(info);
+        }
+        Ok(MultiTopicProducer {
             client: self.pulsar,
             producers: Default::default(),
-            options: self.producer_options.unwrap_or_default(),
+            options,
             name: self.name,
-        }
+            schema_object: self.schema_object,
+        })
     }
 }
 
@@ -1920,6 +2006,259 @@ mod tests {
                 .unwrap();
 
             assert!(send_receipt.producer_id == producer_id);
+        }
+    }
+
+    // ---- Schema / multi-topic tests ----
+
+    /// Minimal PulsarSchema for testing — encodes to payload bytes and
+    /// returns a fixed schema_id.
+    struct TestSchema {
+        schema_id: Option<Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::schema::PulsarSchema<String> for TestSchema {
+        fn schema_info(&self) -> proto::Schema {
+            proto::Schema {
+                name: "test-schema".to_string(),
+                r#type: proto::schema::Type::String as i32,
+                ..Default::default()
+            }
+        }
+
+        async fn encode(
+            &self,
+            _topic: &str,
+            message: String,
+        ) -> Result<crate::schema::EncodeData, Error> {
+            Ok(crate::schema::EncodeData {
+                payload: message.into_bytes(),
+                schema_id: self.schema_id.clone(),
+            })
+        }
+
+        async fn decode(
+            &self,
+            _topic: &str,
+            payload: &crate::Payload,
+            _schema_id: Option<&[u8]>,
+        ) -> Result<String, Error> {
+            String::from_utf8(payload.data.clone()).map_err(|e| Error::Custom(e.to_string()))
+        }
+    }
+
+    #[test]
+    fn build_multi_topic_carries_schema_into_options() {
+        // with_schema sets schema_info; build_multi_topic should merge it
+        // into options.schema so per-topic producers negotiate it with the
+        // broker.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let pulsar: Pulsar<_> = Pulsar::builder("pulsar://127.0.0.1:6650", TokioExecutor)
+                .build()
+                .await
+                .unwrap();
+
+            let schema: Arc<dyn crate::schema::PulsarSchema<String>> =
+                Arc::new(TestSchema { schema_id: Some(vec![1, 2, 3]) });
+
+            let producer = pulsar
+                .producer()
+                .with_schema(schema)
+                .build_multi_topic()
+                .unwrap();
+
+            // The schema should have been merged into options.
+            assert!(
+                producer.options().schema.is_some(),
+                "schema_info should be merged into options.schema"
+            );
+            assert_eq!(
+                producer.options().schema.as_ref().unwrap().name,
+                "test-schema"
+            );
+        });
+    }
+
+    #[test]
+    fn build_multi_topic_carries_schema_object() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let pulsar: Pulsar<_> = Pulsar::builder("pulsar://127.0.0.1:6650", TokioExecutor)
+                .build()
+                .await
+                .unwrap();
+
+            let schema: Arc<dyn crate::schema::PulsarSchema<String>> =
+                Arc::new(TestSchema { schema_id: None });
+
+            let producer = pulsar
+                .producer()
+                .with_schema(schema)
+                .build_multi_topic()
+                .unwrap();
+
+            assert!(
+                producer.schema_object.is_some(),
+                "schema_object should be carried into MultiTopicProducer"
+            );
+        });
+    }
+
+    #[test]
+    fn build_multi_topic_without_schema_has_none() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let pulsar: Pulsar<_> = Pulsar::builder("pulsar://127.0.0.1:6650", TokioExecutor)
+                .build()
+                .await
+                .unwrap();
+
+            let producer = pulsar.producer().build_multi_topic().unwrap();
+
+            assert!(producer.options().schema.is_none());
+            assert!(producer.schema_object.is_none());
+        });
+    }
+
+    #[test]
+    fn cloned_builder_loses_schema_on_build_multi_topic() {
+        // Clone clears both schema_info and schema_object. The clone builds
+        // successfully but the resulting MultiTopicProducer has no schema,
+        // which is the intended safety behavior.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let pulsar: Pulsar<_> = Pulsar::builder("pulsar://127.0.0.1:6650", TokioExecutor)
+                .build()
+                .await
+                .unwrap();
+
+            let schema: Arc<dyn crate::schema::PulsarSchema<String>> =
+                Arc::new(TestSchema { schema_id: None });
+
+            let builder = pulsar.producer().with_schema(schema);
+            let cloned = builder.clone();
+
+            // Original should carry schema:
+            let original = builder.build_multi_topic().unwrap();
+            assert!(
+                original.options().schema.is_some(),
+                "original should have schema"
+            );
+            assert!(
+                original.schema_object.is_some(),
+                "original should have schema_object"
+            );
+
+            // Clone should succeed but without schema:
+            let cloned_producer = cloned.build_multi_topic().unwrap();
+            assert!(
+                cloned_producer.options().schema.is_none(),
+                "cloned builder should not have schema"
+            );
+            assert!(
+                cloned_producer.schema_object.is_none(),
+                "cloned builder should not have schema_object"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn multi_topic_producer_send_schema_non_blocking() {
+        let _result = log::set_logger(&TEST_LOGGER);
+        log::set_max_level(LevelFilter::Debug);
+        let pulsar: Pulsar<_> = Pulsar::builder("pulsar://127.0.0.1:6650", TokioExecutor)
+            .build()
+            .await
+            .unwrap();
+
+        let topic = format!("multi_topic_schema_{}", rand::random::<u16>());
+
+        let schema: Arc<dyn crate::schema::PulsarSchema<String>> =
+            Arc::new(TestSchema { schema_id: Some(vec![0, 1, 2, 3]) });
+
+        let mut producer = pulsar
+            .producer()
+            .with_schema(schema)
+            .build_multi_topic()
+            .unwrap();
+
+        // send_schema_non_blocking should encode via PulsarSchema
+        let _receipt = producer
+            .send_schema_non_blocking(&topic, "hello-schema".to_string(), None)
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn partitioned_topic_producer_with_schema() {
+        let _result = log::set_logger(&TEST_LOGGER);
+        log::set_max_level(LevelFilter::Debug);
+        let pulsar: Pulsar<_> = Pulsar::builder("pulsar://127.0.0.1:6650", TokioExecutor)
+            .build()
+            .await
+            .unwrap();
+
+        let topic = format!("partitioned_schema_{}", rand::random::<u16>());
+        let partition_count = 3;
+        test_utils::create_partitioned_topic("public", "default", &topic, partition_count).await;
+
+        let schema: Arc<dyn crate::schema::PulsarSchema<String>> =
+            Arc::new(TestSchema { schema_id: Some(vec![10, 20]) });
+
+        // Build a single-topic producer (partitioned) with schema
+        let mut producer = pulsar
+            .producer()
+            .with_topic(&topic)
+            .with_schema(schema)
+            .build()
+            .await
+            .unwrap();
+
+        // Send via schema path
+        for i in 0..5 {
+            let _receipt = producer
+                .send_schema_non_blocking(format!("msg-{i}"), None)
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_topic_partitioned_producer_with_schema() {
+        let _result = log::set_logger(&TEST_LOGGER);
+        log::set_max_level(LevelFilter::Debug);
+        let pulsar: Pulsar<_> = Pulsar::builder("pulsar://127.0.0.1:6650", TokioExecutor)
+            .build()
+            .await
+            .unwrap();
+
+        let topic = format!("multi_partitioned_schema_{}", rand::random::<u16>());
+        let partition_count = 3;
+        test_utils::create_partitioned_topic("public", "default", &topic, partition_count).await;
+
+        let schema: Arc<dyn crate::schema::PulsarSchema<String>> =
+            Arc::new(TestSchema { schema_id: Some(vec![7, 8, 9]) });
+
+        let mut producer = pulsar
+            .producer()
+            .with_schema(schema)
+            .build_multi_topic()
+            .unwrap();
+
+        // send_schema_non_blocking to a partitioned topic
+        for i in 0..6 {
+            let _receipt = producer
+                .send_schema_non_blocking(&topic, format!("multi-msg-{i}"), None)
+                .await
+                .unwrap()
+                .await
+                .unwrap();
         }
     }
 
