@@ -1,47 +1,64 @@
-use std::marker::PhantomData;
-
 use crate::{
     consumer::data::MessageData,
     message::proto::{MessageIdData, MessageMetadata},
     DeserializeMessage, Payload,
 };
 
-/// a message received by a consumer
+/// A message received by a consumer.
 ///
-/// it is generic over the type it can be deserialized to
-#[derive(Debug)]
+/// Generic over the type it can be deserialized to.
 pub struct Message<T> {
-    /// origin topic of the message
+    /// Origin topic of the message.
     pub topic: String,
-    /// contains the message's data and other metadata
+    /// Contains the message's data and other metadata.
     pub payload: Payload,
-    /// contains the message's id and batch size data
+    /// Contains the message's id and batch size data.
     pub message_id: MessageData,
-    pub(super) _phantom: PhantomData<T>,
+    /// Pre-decoded value from PulsarSchema. None when using DeserializeMessage path.
+    pub(super) decoded: Option<T>,
+}
+
+// Manual Debug impl — avoids requiring T: Debug
+impl<T> std::fmt::Debug for Message<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Message")
+            .field("topic", &self.topic)
+            .field("payload", &self.payload)
+            .field("message_id", &self.message_id)
+            .field("has_decoded", &self.decoded.is_some())
+            .finish()
+    }
 }
 
 impl<T> Message<T> {
-    /// Pulsar metadata for the message
+    /// Pulsar metadata for the message.
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn metadata(&self) -> &MessageMetadata {
         &self.payload.metadata
     }
 
-    /// Get Pulsar message id for the message
+    /// Get Pulsar message id for the message.
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn message_id(&self) -> &MessageIdData {
         &self.message_id.id
     }
 
-    /// Get message key (partition key)
+    /// Get message key (partition key).
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn key(&self) -> Option<String> {
         self.payload.metadata.partition_key.clone()
     }
+
+    /// Returns the pre-decoded value if this message was decoded via PulsarSchema.
+    /// Returns None when using the DeserializeMessage path.
+    pub fn value(&self) -> Option<&T> {
+        self.decoded.as_ref()
+    }
 }
 
 impl<T: DeserializeMessage> Message<T> {
-    /// directly deserialize a message
+    /// Directly deserialize a message using the DeserializeMessage trait.
+    /// This continues to work unchanged for backward compatibility.
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn deserialize(&self) -> T::Output {
         T::deserialize_message(&self.payload)

@@ -303,7 +303,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
                 batch_size: payload.metadata.num_messages_in_batch,
             },
             payload,
-            _phantom: PhantomData,
+            decoded: None,
         }
     }
 

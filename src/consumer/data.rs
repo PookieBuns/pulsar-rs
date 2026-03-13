@@ -10,6 +10,9 @@ use crate::{
 
 pub type MessageIdDataReceiver = mpsc::Receiver<Result<(MessageIdData, Payload), Error>>;
 
+pub type DecodedMessageReceiver<T> =
+    mpsc::Receiver<Result<(MessageIdData, Payload, Option<T>), Error>>;
+
 pub enum EngineEvent<Exe: Executor> {
     Message(Option<RawMessage>),
     EngineMessage(Option<EngineMessage<Exe>>),
