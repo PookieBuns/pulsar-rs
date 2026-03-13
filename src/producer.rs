@@ -87,9 +87,6 @@ pub struct Message {
     /// UTC Unix timestamp in milliseconds, time at which the message should be
     /// delivered to consumers
     pub deliver_at_time: ::std::option::Option<i64>,
-    /// Schema ID from external schema registry (PIP-420).
-    /// Written to MessageMetadata.schema_id when present.
-    pub schema_id: Option<Vec<u8>>,
 }
 
 impl Message {
@@ -148,7 +145,6 @@ impl From<Message> for ProducerMessage {
             event_time: m.event_time,
             schema_version: m.schema_version,
             deliver_at_time: m.deliver_at_time,
-            schema_id: m.schema_id,
             ..Default::default()
         }
     }
@@ -276,8 +272,9 @@ impl<Exe: Executor> MultiTopicProducer<Exe> {
     /// When a schema has been registered via
     /// [`ProducerBuilder::with_schema`], this method calls
     /// `PulsarSchema::encode` to obtain the payload and the registry
-    /// `schema_id`, then delegates the pre-encoded [`Message`] to the
-    /// per-topic producer.
+    /// `schema_id`, then delegates the pre-encoded message to the
+    /// per-topic producer.  If the attached schema's type parameter does
+    /// not match `T`, an error is returned.
     ///
     /// If no schema is attached, falls back to [`SerializeMessage`].
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -299,20 +296,23 @@ impl<Exe: Executor> MultiTopicProducer<Exe> {
             {
                 let encode_data = schema.encode(&topic, message).await?;
 
-                let serialized_message = if let Some(mut msg) = message_metadata {
+                // Build a Message for metadata, then convert to
+                // ProducerMessage so we can attach schema_id without
+                // exposing it on the public Message type.
+                let msg = if let Some(mut msg) = message_metadata {
                     msg.payload = encode_data.payload;
-                    msg.schema_id = encode_data.schema_id;
                     msg
                 } else {
                     Message {
                         payload: encode_data.payload,
-                        schema_id: encode_data.schema_id,
                         ..Default::default()
                     }
                 };
+                let mut producer_msg: ProducerMessage = msg.into();
+                producer_msg.schema_id = encode_data.schema_id;
 
                 let producer = self.get_or_create_producer(&topic).await?;
-                return producer.send_non_blocking(serialized_message).await;
+                return producer.send_raw(producer_msg).await;
             }
             // Downcast failed — type mismatch.
             return Err(Error::Custom(format!(
@@ -549,24 +549,30 @@ impl<Exe: Executor> Producer<Exe> {
                 let topic = self.topic().to_string();
                 let encode_data = schema.encode(&topic, message).await?;
 
-                let serialized_message = if let Some(mut msg) = message_metadata {
+                // Build a Message for metadata / partition routing, then
+                // convert to ProducerMessage so we can attach schema_id
+                // without exposing it on the public Message type.
+                let msg = if let Some(mut msg) = message_metadata {
                     msg.payload = encode_data.payload;
-                    msg.schema_id = encode_data.schema_id;
                     msg
                 } else {
                     Message {
                         payload: encode_data.payload,
-                        schema_id: encode_data.schema_id,
                         ..Default::default()
                     }
                 };
 
                 return match &mut self.inner {
-                    ProducerInner::Single(p) => p.send(serialized_message).await,
+                    ProducerInner::Single(p) => {
+                        let mut pm: ProducerMessage = msg.into();
+                        pm.schema_id = encode_data.schema_id;
+                        p.send_raw(pm).await
+                    }
                     ProducerInner::Partitioned(p) => {
-                        p.choose_partition(&serialized_message)
-                            .send(serialized_message)
-                            .await
+                        let tp = p.choose_partition(&msg);
+                        let mut pm: ProducerMessage = msg.into();
+                        pm.schema_id = encode_data.schema_id;
+                        tp.send_raw(pm).await
                     }
                 };
             }
@@ -586,6 +592,26 @@ impl<Exe: Executor> Producer<Exe> {
                 p.choose_partition(&serialized_message)
                     .send(serialized_message)
                     .await
+            }
+        }
+    }
+
+    /// Send a pre-built [`ProducerMessage`] directly (internal use).
+    ///
+    /// This by-passes `Message` → `ProducerMessage` conversion so callers
+    /// can set fields that are not part of the public [`Message`] type
+    /// (e.g. `schema_id`).
+    pub(crate) async fn send_raw(&mut self, message: ProducerMessage) -> Result<SendFuture, Error> {
+        match &mut self.inner {
+            ProducerInner::Single(p) => p.send_raw(message).await,
+            ProducerInner::Partitioned(p) => {
+                // Build a lightweight Message for partition routing only.
+                let routing_hint = Message {
+                    partition_key: message.partition_key.clone(),
+                    ordering_key: message.ordering_key.clone(),
+                    ..Default::default()
+                };
+                p.choose_partition(&routing_hint).send_raw(message).await
             }
         }
     }
@@ -1300,17 +1326,17 @@ impl<Exe: Executor> ProducerBuilder<Exe> {
     ///    attached `PulsarSchema`.
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn build_multi_topic(self) -> MultiTopicProducer<Exe> {
-        // Clone clears both schema_info and schema_object together, so this
-        // state (schema_info present but schema_object missing) should never
-        // occur through normal API usage.
-        debug_assert!(
-            !(self.schema_info.is_some() && self.schema_object.is_none()),
-            "schema_object lost — was build_multi_topic() called on a builder \
-             in an inconsistent state? Only the original (non-cloned) builder \
-             retains the schema."
-        );
         let mut options = self.producer_options.unwrap_or_default();
-        if let Some(info) = self.schema_info {
+        if self.schema_info.is_some() && self.schema_object.is_none() {
+            // Same invariant that build() checks via Result::Err.  We cannot
+            // return Result here (backward-compat), so log an error and drop
+            // the schema config to prevent silent corruption at send time.
+            log::error!(
+                "build_multi_topic(): schema_info present but schema_object missing — \
+                 was this called on a cloned builder? Only the original builder retains \
+                 the schema.  The schema will be dropped to avoid silent corruption."
+            );
+        } else if let Some(info) = self.schema_info {
             options.schema = Some(info);
         }
         MultiTopicProducer {
@@ -1789,7 +1815,6 @@ mod tests {
             event_time: Some(42),
             schema_version: Some(vec![9, 9]),
             deliver_at_time: Some(123456789),
-            schema_id: None,
         };
 
         let pm: ProducerMessage = m.clone().into();

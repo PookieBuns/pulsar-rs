@@ -1,4 +1,5 @@
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,6 +49,8 @@ pub struct ConfluentJsonSchema<T> {
     sr_settings: SrSettings,
     subject_strategy: SubjectNameStrategy,
     is_key: bool,
+    /// Ensures the "not yet implemented" warning is emitted at most once.
+    warned: AtomicBool,
     _phantom: PhantomData<fn(T)>,
 }
 
@@ -80,6 +83,7 @@ impl<T> ConfluentJsonSchema<T> {
             sr_settings,
             subject_strategy: config.subject_name_strategy,
             is_key,
+            warned: AtomicBool::new(false),
             _phantom: PhantomData,
         })
     }
@@ -117,13 +121,19 @@ where
         // A future iteration will wire the schema_registry_converter encode API
         // to register schemas and extract the Confluent schema ID, then re-frame
         // it with Pulsar's 0xFF magic byte via schema_id_util::add_magic_header().
-        let _subject = self.subject_name(topic);
-        log::warn!(
-            "ConfluentJsonSchema::encode(): schema registration not yet implemented \
-             for subject '{}' on topic '{topic}' — returning schema_id: None. \
-             Messages will be sent without external schema framing.",
-            _subject,
-        );
+        let subject = self.subject_name(topic);
+        if !self.warned.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "ConfluentJsonSchema::encode(): schema registration not yet implemented \
+                 for subject '{subject}' on topic '{topic}' — returning schema_id: None. \
+                 Messages will be sent without external schema framing.",
+            );
+        } else {
+            log::debug!(
+                "ConfluentJsonSchema::encode(): schema_id: None for subject '{subject}' \
+                 on topic '{topic}' (not-yet-implemented placeholder)",
+            );
+        }
 
         Ok(EncodeData {
             payload: json_bytes,
