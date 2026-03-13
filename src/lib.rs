@@ -224,6 +224,7 @@ pub mod producer;
 pub mod reader;
 mod retry_op;
 pub mod routing_policy;
+pub mod schema;
 mod service_discovery;
 mod test_utils;
 
