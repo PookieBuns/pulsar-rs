@@ -50,6 +50,7 @@ impl<T: DeserializeMessage + Send + 'static, Exe: Executor> TopicConsumer<T, Exe
         topic: String,
         addr: BrokerAddress,
         config: ConsumerConfig,
+        schema: Option<Arc<dyn crate::schema::PulsarSchema<T>>>,
     ) -> Result<TopicConsumer<T, Exe>, Error> {
         static CONSUMER_ID_GENERATOR: AtomicU64 = AtomicU64::new(0);
 
@@ -138,19 +139,53 @@ impl<T: DeserializeMessage + Send + 'static, Exe: Executor> TopicConsumer<T, Exe
                 receiver_queue_size as usize,
             );
 
-        // Pass-through adapter: converts (id, payload) -> (id, payload, None)
-        let adapter_task = client.executor.spawn(Box::pin(async move {
-            let mut raw_rx = rx;
-            let mut decoded_tx = decoded_tx;
-            while let Some(result) = raw_rx.next().await {
-                let mapped = result.map(|(id, payload)| (id, payload, None));
-                if decoded_tx.send(mapped).await.is_err() {
-                    break;
+        if let Some(schema) = schema {
+            // Schema decode task: async decode via PulsarSchema<T>
+            let decode_topic = topic.clone();
+            let decode_task = client.executor.spawn(Box::pin(async move {
+                let mut raw_rx = rx;
+                let mut decoded_tx = decoded_tx;
+                while let Some(result) = raw_rx.next().await {
+                    let mapped = match result {
+                        Ok((id, payload)) => {
+                            let schema_id_bytes = payload.metadata.schema_id.clone();
+                            match schema
+                                .decode(
+                                    &decode_topic,
+                                    &payload,
+                                    schema_id_bytes.as_deref(),
+                                )
+                                .await
+                            {
+                                Ok(decoded) => Ok((id, payload, Some(decoded))),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    };
+                    if decoded_tx.send(mapped).await.is_err() {
+                        break;
+                    }
                 }
+            }));
+            if decode_task.is_err() {
+                return Err(Error::Executor);
             }
-        }));
-        if adapter_task.is_err() {
-            return Err(Error::Executor);
+        } else {
+            // No schema: pass-through adapter (id, payload) -> (id, payload, None)
+            let adapter_task = client.executor.spawn(Box::pin(async move {
+                let mut raw_rx = rx;
+                let mut decoded_tx = decoded_tx;
+                while let Some(result) = raw_rx.next().await {
+                    let mapped = result.map(|(id, payload)| (id, payload, None));
+                    if decoded_tx.send(mapped).await.is_err() {
+                        break;
+                    }
+                }
+            }));
+            if adapter_task.is_err() {
+                return Err(Error::Executor);
+            }
         }
 
         Ok(TopicConsumer {

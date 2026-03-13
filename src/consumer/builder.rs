@@ -321,14 +321,15 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
         }
 
         // Downcast schema_object: Box<dyn Any> wrapping Arc<dyn PulsarSchema<T>>
-        let _schema: Option<Arc<dyn crate::schema::PulsarSchema<T>>> =
+        let schema: Option<Arc<dyn crate::schema::PulsarSchema<T>>> =
             self.schema_object.as_ref().and_then(|obj| {
                 obj.downcast_ref::<Arc<dyn crate::schema::PulsarSchema<T>>>()
                     .cloned()
             });
 
         let consumers = try_join_all(joined_topics.into_iter().map(|(topic, addr)| {
-            TopicConsumer::new(self.pulsar.clone(), topic, addr, config.clone())
+            let schema = schema.clone();
+            TopicConsumer::new(self.pulsar.clone(), topic, addr, config.clone(), schema)
         }))
         .await?;
 
@@ -382,7 +383,7 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
         }
 
         // Downcast schema (same pattern as build())
-        let _schema: Option<Arc<dyn crate::schema::PulsarSchema<T>>> =
+        let schema: Option<Arc<dyn crate::schema::PulsarSchema<T>>> =
             self.schema_object.as_ref().and_then(|obj| {
                 obj.downcast_ref::<Arc<dyn crate::schema::PulsarSchema<T>>>()
                     .cloned()
@@ -404,7 +405,7 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
         }
 
         let (topic, addr) = joined_topics.pop().unwrap();
-        let consumer = TopicConsumer::new(self.pulsar.clone(), topic, addr, config.clone()).await?;
+        let consumer = TopicConsumer::new(self.pulsar.clone(), topic, addr, config.clone(), schema).await?;
 
         Ok(Reader {
             consumer,
