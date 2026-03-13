@@ -113,20 +113,17 @@ where
         let json_bytes = serde_json::to_vec(&message)
             .map_err(|e| Error::SchemaRegistry(e.to_string()))?;
 
-        // Schema registration and ID retrieval is a placeholder for now.
+        // Schema registration and ID retrieval is not yet implemented.
         // A future iteration will wire the schema_registry_converter encode API
         // to register schemas and extract the Confluent schema ID, then re-frame
         // it with Pulsar's 0xFF magic byte via schema_id_util::add_magic_header().
         let _subject = self.subject_name(topic);
-        {
-            use std::sync::Once;
-            static WARN_ONCE: Once = Once::new();
-            WARN_ONCE.call_once(|| {
-                log::warn!(
-                    "Confluent encode: schema registration not yet wired — schema_id will be None"
-                );
-            });
-        }
+        log::warn!(
+            "ConfluentJsonSchema::encode(): schema registration not yet implemented \
+             for subject '{}' on topic '{topic}' — returning schema_id: None. \
+             Messages will be sent without external schema framing.",
+            _subject,
+        );
 
         Ok(EncodeData {
             payload: json_bytes,

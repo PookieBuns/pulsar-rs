@@ -85,9 +85,21 @@ where
         let (key, value) = message;
         let key_data = self.key_schema.encode(topic, key).await?;
         let value_data = self.value_schema.encode(topic, value).await?;
+
+        // Inner schemas return schema IDs framed with a 0xFF magic prefix.
+        // Strip that prefix before KV-framing to avoid double-framing — the KV
+        // envelope (0xFE + length-delimited) is the only framing on the wire.
+        // On decode, strip_magic_header extracts raw inner IDs which are passed
+        // directly to inner schemas' decode(), completing the round-trip.
         let schema_id = schema_id_util::generate_kv_schema_id(
-            key_data.schema_id.as_deref(),
-            value_data.schema_id.as_deref(),
+            key_data
+                .schema_id
+                .as_deref()
+                .map(schema_id_util::strip_single_magic_prefix),
+            value_data
+                .schema_id
+                .as_deref()
+                .map(schema_id_util::strip_single_magic_prefix),
         );
         Ok(EncodeData {
             payload: combine_kv_payload(&key_data.payload, &value_data.payload),
@@ -107,12 +119,11 @@ where
                     (Some(key_id), Some(value_id))
                 }
                 Some(SchemaIdInfo::Single(_)) => {
-                    log::warn!(
-                        "KV decode received Single schema_id framing on topic {} — \
-                         possible protocol/configuration mismatch; falling back to no schema IDs",
-                        topic
-                    );
-                    (None, None)
+                    return Err(Error::Custom(format!(
+                        "KV decode received Single (0xFF) schema_id framing on topic \
+                         {topic} — expected KeyValue (0xFE) framing. This indicates a \
+                         protocol or producer configuration mismatch."
+                    )));
                 }
                 None => (None, None),
             },
@@ -211,6 +222,103 @@ mod tests {
 
         let framed = encoded.schema_id.unwrap();
         assert_eq!(framed[0], schema_id_util::MAGIC_BYTE_KEY_VALUE);
+
+        // Verify inner IDs are stored WITHOUT the 0xFF magic prefix (no double-framing).
+        // The KV frame should contain raw inner IDs: [0xFE, key_len(4), 0x01, 0x02]
+        let info = schema_id_util::strip_magic_header(&framed).unwrap().unwrap();
+        match info {
+            schema_id_util::SchemaIdInfo::KeyValue { key_id, value_id } => {
+                // Raw inner IDs — no 0xFF prefix
+                assert_eq!(key_id, vec![0x01], "key_id should be raw, without 0xFF prefix");
+                assert_eq!(value_id, vec![0x02], "value_id should be raw, without 0xFF prefix");
+            }
+            other => panic!("expected KeyValue, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_kv_encode_decode_roundtrip_with_schema_ids() {
+        // Verifies that inner schema IDs survive the encode→decode round-trip
+        // without double-framing. The recording mock captures the schema_id
+        // received by decode() so we can assert it matches the raw (unframed) ID.
+        use std::sync::Mutex;
+
+        struct RecordingSchema {
+            encode_id: Option<Vec<u8>>,
+            decoded_ids: Arc<Mutex<Vec<Option<Vec<u8>>>>>,
+        }
+
+        #[async_trait]
+        impl PulsarSchema<String> for RecordingSchema {
+            fn schema_info(&self) -> proto::Schema {
+                proto::Schema::default()
+            }
+            async fn encode(&self, _topic: &str, msg: String) -> Result<EncodeData, Error> {
+                Ok(EncodeData {
+                    payload: msg.into_bytes(),
+                    schema_id: self.encode_id.clone(),
+                })
+            }
+            async fn decode(
+                &self,
+                _topic: &str,
+                payload: &Payload,
+                schema_id: Option<&[u8]>,
+            ) -> Result<String, Error> {
+                self.decoded_ids
+                    .lock()
+                    .unwrap()
+                    .push(schema_id.map(|s| s.to_vec()));
+                String::from_utf8(payload.data.clone()).map_err(|e| Error::Custom(e.to_string()))
+            }
+        }
+
+        let key_decoded = Arc::new(Mutex::new(Vec::new()));
+        let val_decoded = Arc::new(Mutex::new(Vec::new()));
+
+        let kv_schema = KeyValueSchema::new(
+            Arc::new(RecordingSchema {
+                encode_id: Some(schema_id_util::add_magic_header(&[0x00, 0x01])),
+                decoded_ids: key_decoded.clone(),
+            }),
+            Arc::new(RecordingSchema {
+                encode_id: Some(schema_id_util::add_magic_header(&[0x00, 0x02])),
+                decoded_ids: val_decoded.clone(),
+            }),
+        );
+
+        let encoded = kv_schema
+            .encode("t", ("k".to_string(), "v".to_string()))
+            .await
+            .unwrap();
+
+        let payload = Payload {
+            metadata: proto::MessageMetadata::default(),
+            data: encoded.payload,
+        };
+        let (k, v) = kv_schema
+            .decode("t", &payload, encoded.schema_id.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(k, "k");
+        assert_eq!(v, "v");
+
+        // Inner decode() should receive raw IDs (without 0xFF prefix)
+        let key_ids = key_decoded.lock().unwrap();
+        assert_eq!(key_ids.len(), 1);
+        assert_eq!(
+            key_ids[0].as_deref(),
+            Some([0x00, 0x01].as_slice()),
+            "inner key decode should receive raw ID without 0xFF prefix"
+        );
+
+        let val_ids = val_decoded.lock().unwrap();
+        assert_eq!(val_ids.len(), 1);
+        assert_eq!(
+            val_ids[0].as_deref(),
+            Some([0x00, 0x02].as_slice()),
+            "inner value decode should receive raw ID without 0xFF prefix"
+        );
     }
 
     #[tokio::test]
@@ -222,5 +330,32 @@ mod tests {
 
         let info = kv_schema.schema_info();
         assert_eq!(info.r#type, proto::schema::Type::KeyValue as i32);
+    }
+
+    #[tokio::test]
+    async fn test_kv_decode_rejects_single_framed_schema_id() {
+        let kv_schema = KeyValueSchema::new(
+            Arc::new(MockSchema { schema_id: None }),
+            Arc::new(MockSchema { schema_id: None }),
+        );
+
+        // Build a valid KV payload
+        let payload = Payload {
+            metadata: proto::MessageMetadata::default(),
+            data: combine_kv_payload(b"key", b"value"),
+        };
+
+        // Pass a Single-framed schema_id (0xFF prefix) — should be an error,
+        // not silently degraded to (None, None).
+        let single_framed = schema_id_util::add_magic_header(&[0x00, 0x01]);
+        let result = kv_schema
+            .decode("topic", &payload, Some(&single_framed))
+            .await;
+        assert!(result.is_err(), "KV decode with Single framing should error");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Single (0xFF)"),
+            "error should mention Single framing, got: {err_msg}"
+        );
     }
 }

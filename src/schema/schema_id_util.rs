@@ -53,6 +53,31 @@ pub fn strip_magic_header(data: &[u8]) -> Result<Option<SchemaIdInfo>, crate::Er
     }
 }
 
+/// Strip the single-value magic prefix (`0xFF`) from an inner schema ID.
+///
+/// Inner `PulsarSchema::encode()` returns schema IDs framed with the `0xFF`
+/// magic byte (via `add_magic_header`).  When composing a key-value schema ID,
+/// we need the **raw** inner IDs — the KV frame (`0xFE`) provides its own
+/// length-delimited envelope, so the inner `0xFF` prefix must be removed to
+/// avoid double-framing.
+///
+/// Returns the raw bytes after stripping. If the prefix is absent the input is
+/// returned unchanged (defensive — inner schemas *should* always frame).
+pub fn strip_single_magic_prefix(data: &[u8]) -> &[u8] {
+    if data.first() == Some(&MAGIC_BYTE_VALUE) {
+        &data[1..]
+    } else {
+        data
+    }
+}
+
+/// Build a KV-framed schema ID from **raw** (unframed) inner schema IDs.
+///
+/// Callers must strip the inner `0xFF` magic prefix before calling this
+/// function — use [`strip_single_magic_prefix`] on values returned by inner
+/// `PulsarSchema::encode()`.
+///
+/// Wire format: `[0xFE] [4-byte key_len BE] [raw_key_id] [raw_value_id]`
 pub fn generate_kv_schema_id(
     key_schema_id: Option<&[u8]>,
     value_schema_id: Option<&[u8]>,
@@ -164,5 +189,34 @@ mod tests {
                 value_id: val_id,
             }
         );
+    }
+
+    #[test]
+    fn test_strip_single_magic_prefix_with_prefix() {
+        let framed = add_magic_header(&[0x00, 0x01]);
+        assert_eq!(strip_single_magic_prefix(&framed), &[0x00, 0x01]);
+    }
+
+    #[test]
+    fn test_strip_single_magic_prefix_without_prefix() {
+        let raw = vec![0x00, 0x01];
+        assert_eq!(strip_single_magic_prefix(&raw), &[0x00, 0x01]);
+    }
+
+    #[test]
+    fn test_strip_single_magic_prefix_empty() {
+        assert_eq!(strip_single_magic_prefix(&[]), &[] as &[u8]);
+    }
+
+    #[test]
+    fn test_strip_single_magic_prefix_only_magic_byte() {
+        assert_eq!(strip_single_magic_prefix(&[MAGIC_BYTE_VALUE]), &[] as &[u8]);
+    }
+
+    #[test]
+    fn test_strip_single_magic_prefix_kv_magic_untouched() {
+        // KV magic byte (0xFE) should NOT be stripped
+        let data = vec![MAGIC_BYTE_KEY_VALUE, 0x01, 0x02];
+        assert_eq!(strip_single_magic_prefix(&data), data.as_slice());
     }
 }

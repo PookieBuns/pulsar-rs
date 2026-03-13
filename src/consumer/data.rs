@@ -22,8 +22,9 @@ pub type DecodedMessageReceiver<T> =
     mpsc::Receiver<Result<(MessageIdData, Payload, Option<T>, Option<String>), Error>>;
 
 /// Unified receiver that avoids spawning a pass-through task when no schema is
-/// attached. When polling, `Raw` maps `(id, payload)` → `(id, payload, None)`
-/// inline without an extra async task or channel hop.
+/// attached. When polling, `Raw` maps `(id, payload)` →
+/// `(id, payload, None, None)` inline without an extra async task or channel
+/// hop.
 pub enum MessageReceiver<T> {
     /// No schema: poll the raw engine receiver directly.
     Raw(MessageIdDataReceiver),
