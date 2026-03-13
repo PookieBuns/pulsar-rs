@@ -17,26 +17,39 @@ pub fn add_magic_header(schema_id: &[u8]) -> Vec<u8> {
     result
 }
 
-pub fn strip_magic_header(data: &[u8]) -> Option<SchemaIdInfo> {
+/// Parse a magic-byte-framed schema ID from raw bytes.
+///
+/// Returns:
+/// - `Ok(None)` — no magic byte present (data has no schema framing)
+/// - `Ok(Some(info))` — valid framing parsed successfully
+/// - `Err(...)` — magic byte present but data is truncated / corrupt
+pub fn strip_magic_header(data: &[u8]) -> Result<Option<SchemaIdInfo>, crate::Error> {
     if data.is_empty() {
-        return None;
+        return Ok(None);
     }
     match data[0] {
-        MAGIC_BYTE_VALUE => Some(SchemaIdInfo::Single(data[1..].to_vec())),
+        MAGIC_BYTE_VALUE => Ok(Some(SchemaIdInfo::Single(data[1..].to_vec()))),
         MAGIC_BYTE_KEY_VALUE => {
             if data.len() < 5 {
-                return None;
+                return Err(crate::Error::Custom(format!(
+                    "corrupt KV schema_id: expected at least 5 bytes, got {}",
+                    data.len()
+                )));
             }
             let key_len =
                 u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
             if data.len() < 5 + key_len {
-                return None;
+                return Err(crate::Error::Custom(format!(
+                    "corrupt KV schema_id: key_len={} but only {} bytes remain",
+                    key_len,
+                    data.len() - 5
+                )));
             }
             let key_id = data[5..5 + key_len].to_vec();
             let value_id = data[5 + key_len..].to_vec();
-            Some(SchemaIdInfo::KeyValue { key_id, value_id })
+            Ok(Some(SchemaIdInfo::KeyValue { key_id, value_id }))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -81,18 +94,32 @@ mod tests {
     fn test_strip_magic_header_single() {
         let id = vec![0x00, 0x00, 0x00, 0x05];
         let framed = add_magic_header(&id);
-        let info = strip_magic_header(&framed).unwrap();
+        let info = strip_magic_header(&framed).unwrap().unwrap();
         assert_eq!(info, SchemaIdInfo::Single(id));
     }
 
     #[test]
     fn test_strip_magic_header_empty_input() {
-        assert_eq!(strip_magic_header(&[]), None);
+        assert!(strip_magic_header(&[]).unwrap().is_none());
     }
 
     #[test]
     fn test_strip_magic_header_no_magic() {
-        assert_eq!(strip_magic_header(&[0x00, 0x01, 0x02]), None);
+        assert!(strip_magic_header(&[0x00, 0x01, 0x02]).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_strip_magic_header_corrupt_kv() {
+        // KV magic byte but truncated data — should return Err, not None
+        let data = vec![MAGIC_BYTE_KEY_VALUE, 0x00];
+        assert!(strip_magic_header(&data).is_err());
+    }
+
+    #[test]
+    fn test_strip_magic_header_corrupt_kv_key_len() {
+        // KV magic byte, valid key_len=10 but only 2 bytes of data after header
+        let data = vec![MAGIC_BYTE_KEY_VALUE, 0x00, 0x00, 0x00, 0x0A, 0x01, 0x02];
+        assert!(strip_magic_header(&data).is_err());
     }
 
     #[test]
@@ -129,7 +156,7 @@ mod tests {
         let key_id = vec![0x01, 0x02];
         let val_id = vec![0x03, 0x04, 0x05];
         let framed = generate_kv_schema_id(Some(&key_id), Some(&val_id)).unwrap();
-        let info = strip_magic_header(&framed).unwrap();
+        let info = strip_magic_header(&framed).unwrap().unwrap();
         assert_eq!(
             info,
             SchemaIdInfo::KeyValue {

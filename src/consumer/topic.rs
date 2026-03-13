@@ -19,7 +19,7 @@ use crate::{
     connection::Connection,
     consumer::{
         config::ConsumerConfig,
-        data::{DeadLetterPolicy, DecodedMessageReceiver, EngineMessage, MessageData},
+        data::{DeadLetterPolicy, EngineMessage, MessageData, MessageReceiver},
         engine::ConsumerEngine,
         message::Message,
     },
@@ -35,7 +35,7 @@ pub struct TopicConsumer<T: DeserializeMessage + Send, Exe: Executor> {
     pub(crate) consumer_id: u64,
     pub(crate) config: ConsumerConfig,
     topic: String,
-    messages: Pin<Box<DecodedMessageReceiver<T>>>,
+    messages: Pin<Box<MessageReceiver<T>>>,
     engine_tx: mpsc::UnboundedSender<EngineMessage<Exe>>,
     data_type: PhantomData<fn(Payload) -> T::Output>,
     pub(crate) dead_letter_policy: Option<DeadLetterPolicy>,
@@ -133,14 +133,15 @@ impl<T: DeserializeMessage + Send + 'static, Exe: Executor> TopicConsumer<T, Exe
             return Err(Error::Executor);
         }
 
-        // Create the decoded channel (unified type for both schema and no-schema paths)
-        let (decoded_tx, decoded_rx) =
-            mpsc::channel::<Result<(MessageIdData, Payload, Option<T>), Error>>(
-                receiver_queue_size as usize,
-            );
-
-        if let Some(schema) = schema {
-            // Schema decode task: async decode via PulsarSchema<T>
+        // Build the message receiver.
+        // When a schema is attached, spawn an async decode task that writes to a
+        // decoded channel. Otherwise, wrap the raw receiver directly — no extra
+        // task or channel hop needed (I2 fix).
+        let messages: MessageReceiver<T> = if let Some(schema) = schema {
+            let (decoded_tx, decoded_rx) =
+                mpsc::channel::<Result<(MessageIdData, Payload, Option<T>), Error>>(
+                    receiver_queue_size as usize,
+                );
             let decode_topic = topic.clone();
             let decode_task = client.executor.spawn(Box::pin(async move {
                 let mut raw_rx = rx;
@@ -178,28 +179,17 @@ impl<T: DeserializeMessage + Send + 'static, Exe: Executor> TopicConsumer<T, Exe
             if decode_task.is_err() {
                 return Err(Error::Executor);
             }
+            MessageReceiver::Decoded(decoded_rx)
         } else {
-            // No schema: pass-through adapter (id, payload) -> (id, payload, None)
-            let adapter_task = client.executor.spawn(Box::pin(async move {
-                let mut raw_rx = rx;
-                let mut decoded_tx = decoded_tx;
-                while let Some(result) = raw_rx.next().await {
-                    let mapped = result.map(|(id, payload)| (id, payload, None));
-                    if decoded_tx.send(mapped).await.is_err() {
-                        break;
-                    }
-                }
-            }));
-            if adapter_task.is_err() {
-                return Err(Error::Executor);
-            }
-        }
+            // No schema: use raw receiver directly, mapped inline in poll_next.
+            MessageReceiver::Raw(rx)
+        };
 
         Ok(TopicConsumer {
             consumer_id,
             config,
             topic,
-            messages: Box::pin(decoded_rx),
+            messages: Box::pin(messages),
             engine_tx,
             data_type: PhantomData,
             dead_letter_policy,

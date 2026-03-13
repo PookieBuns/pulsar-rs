@@ -102,7 +102,7 @@ where
         schema_id: Option<&[u8]>,
     ) -> Result<(K, V), Error> {
         let (key_id, value_id) = match schema_id {
-            Some(data) => match schema_id_util::strip_magic_header(data) {
+            Some(data) => match schema_id_util::strip_magic_header(data)? {
                 Some(SchemaIdInfo::KeyValue { key_id, value_id }) => {
                     (Some(key_id), Some(value_id))
                 }

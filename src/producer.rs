@@ -68,6 +68,7 @@ impl Future for SendFuture {
 /// this is actually a subset of the fields of a message, because batching,
 /// compression and encryption should be handled by the producer
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct Message {
     /// serialized data
     pub payload: Vec<u8>,
@@ -90,6 +91,17 @@ pub struct Message {
     /// Schema ID from external schema registry (PIP-420).
     /// Written to MessageMetadata.schema_id when present.
     pub schema_id: Option<Vec<u8>>,
+}
+
+impl Message {
+    /// Create a `Message` carrying the given payload with all other fields
+    /// set to their defaults.
+    pub fn new(payload: Vec<u8>) -> Self {
+        Self {
+            payload,
+            ..Default::default()
+        }
+    }
 }
 
 /// internal message type carrying options that must be defined
@@ -1091,7 +1103,8 @@ impl<Exe: Executor> Clone for ProducerBuilder<Exe> {
             name: self.name.clone(),
             producer_options: self.producer_options.clone(),
             schema_info: self.schema_info.clone(),
-            // schema_object is NOT cloned — only the original builder carries the schema.
+            // schema_object cannot be cloned (Box<dyn Any>). The original builder
+            // retains it; clones are only valid for non-schema paths.
             schema_object: None,
         }
     }
@@ -1373,14 +1386,45 @@ async fn message_send_loop<Exe>(
                 };
                 let counter = batch_items.len();
 
-                // Extract schema_id from first message (PIP-420: all messages in batch share same schema_id)
-                let batch_schema_id = batch_items.iter().find_map(|item| {
-                    if let BatchItem::SingleMessage(_, _, schema_id) = item {
-                        schema_id.clone()
-                    } else {
-                        None
+                // Extract and validate schema_id across the batch (PIP-420).
+                // All messages must share the same schema_id; mixed batches are rejected.
+                let batch_schema_id = {
+                    let mut first_id: Option<Option<Vec<u8>>> = None;
+                    let mut conflict = false;
+                    for item in batch_items.iter() {
+                        if let BatchItem::SingleMessage(_, _, schema_id) = item {
+                            match &first_id {
+                                None => first_id = Some(schema_id.clone()),
+                                Some(prev) if prev != schema_id => {
+                                    conflict = true;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
                     }
-                });
+                    if conflict {
+                        error!(
+                            "producer {}: batch contains messages with different schema_ids — \
+                             rejecting entire batch",
+                            producer_id
+                        );
+                        // Fail all messages in the batch
+                        for item in batch_items {
+                            if let BatchItem::SingleMessage(tx, _, _) = item {
+                                let _ = tx.send(Err(Error::Custom(
+                                    "Batch rejected: messages have conflicting schema_ids"
+                                        .to_string(),
+                                )));
+                            }
+                        }
+                        if let Some(flush_tx) = flush_tx {
+                            let _ = flush_tx.send(());
+                        }
+                        continue;
+                    }
+                    first_id.flatten()
+                };
 
                 for item in batch_items {
                     if let BatchItem::SingleMessage(tx, batched_msg, _) = item {

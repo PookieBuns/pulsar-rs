@@ -57,7 +57,9 @@ impl<Exe: Executor> Clone for ConsumerBuilder<Exe> {
             namespace: self.namespace.clone(),
             topic_refresh: self.topic_refresh,
             schema_info: self.schema_info.clone(),
-            // schema_object is NOT cloned — only the original builder carries the schema.
+            // schema_object cannot be cloned (Box<dyn Any>). The original builder
+            // retains it; clones are only valid for validate(). build() and
+            // into_reader() assert the original's schema_object is intact.
             schema_object: None,
         }
     }
@@ -311,7 +313,12 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
     /// creates a [Consumer] from this builder
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn build<T: DeserializeMessage + Send + 'static>(self) -> Result<Consumer<T, Exe>, Error> {
-        // would this clone() consume too much memory?
+        // clone() is only used for validate(); schema_object is NOT cloneable.
+        // Guard: if schema_info is set, schema_object must still be present on `self`.
+        debug_assert!(
+            self.schema_info.is_none() || self.schema_object.is_some(),
+            "BUG: schema_info present but schema_object lost (was build() called on a clone?)"
+        );
         let (config, joined_topics) = self.clone().validate().await?;
 
         // Apply schema_info to options if set (takes precedence over .with_options())
@@ -387,7 +394,10 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
     /// creates a [Reader] from this builder
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn into_reader<T: DeserializeMessage + Send + 'static>(self) -> Result<Reader<T, Exe>, Error> {
-        // would this clone() consume too much memory?
+        debug_assert!(
+            self.schema_info.is_none() || self.schema_object.is_some(),
+            "BUG: schema_info present but schema_object lost (was into_reader() called on a clone?)"
+        );
         let (mut config, mut joined_topics) = self.clone().validate().await?;
 
         if let Some(ref info) = self.schema_info {
