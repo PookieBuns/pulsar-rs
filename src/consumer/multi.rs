@@ -22,7 +22,7 @@ use crate::{
 
 /// A consumer that can subscribe on multiple topics, from a regex matching
 /// topic names
-pub struct MultiTopicConsumer<T: DeserializeMessage, Exe: Executor> {
+pub struct MultiTopicConsumer<T: DeserializeMessage + Send, Exe: Executor> {
     pub(super) namespace: String,
     pub(super) topic_regex: Option<Regex>,
     pub(super) pulsar: Pulsar<Exe>,
@@ -40,7 +40,7 @@ pub struct MultiTopicConsumer<T: DeserializeMessage, Exe: Executor> {
     pub(super) disc_last_message_received: Option<DateTime<Utc>>,
 }
 
-impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
+impl<T: DeserializeMessage + Send + 'static, Exe: Executor> MultiTopicConsumer<T, Exe> {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn topics(&self) -> Vec<String> {
         self.topics.iter().map(|s| s.to_string()).collect()
@@ -327,7 +327,7 @@ impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
     }
 }
 
-impl<T: DeserializeMessage, Exe: Executor> Debug for MultiTopicConsumer<T, Exe> {
+impl<T: DeserializeMessage + Send, Exe: Executor> Debug for MultiTopicConsumer<T, Exe> {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
@@ -338,7 +338,7 @@ impl<T: DeserializeMessage, Exe: Executor> Debug for MultiTopicConsumer<T, Exe> 
     }
 }
 
-impl<T: 'static + DeserializeMessage, Exe: Executor> Stream for MultiTopicConsumer<T, Exe> {
+impl<T: 'static + DeserializeMessage + Send, Exe: Executor> Stream for MultiTopicConsumer<T, Exe> {
     type Item = Result<Message<T>, Error>;
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]

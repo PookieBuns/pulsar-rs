@@ -268,7 +268,7 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
 
     /// creates a [Consumer] from this builder
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub async fn build<T: DeserializeMessage>(self) -> Result<Consumer<T, Exe>, Error> {
+    pub async fn build<T: DeserializeMessage + Send + 'static>(self) -> Result<Consumer<T, Exe>, Error> {
         // would this clone() consume too much memory?
         let (config, joined_topics) = self.clone().validate().await?;
 
@@ -318,7 +318,7 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
 
     /// creates a [Reader] from this builder
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub async fn into_reader<T: DeserializeMessage>(self) -> Result<Reader<T, Exe>, Error> {
+    pub async fn into_reader<T: DeserializeMessage + Send + 'static>(self) -> Result<Reader<T, Exe>, Error> {
         // would this clone() consume too much memory?
         let (mut config, mut joined_topics) = self.clone().validate().await?;
 

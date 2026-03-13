@@ -40,7 +40,7 @@ use crate::{
     DeserializeMessage, Pulsar,
 };
 
-enum InnerConsumer<T: DeserializeMessage, Exe: Executor> {
+enum InnerConsumer<T: DeserializeMessage + Send, Exe: Executor> {
     Single(TopicConsumer<T, Exe>),
     Multi(MultiTopicConsumer<T, Exe>),
 }
@@ -79,11 +79,11 @@ enum InnerConsumer<T: DeserializeMessage, Exe: Executor> {
 /// # Ok(())
 /// # }
 /// ```
-pub struct Consumer<T: DeserializeMessage, Exe: Executor> {
+pub struct Consumer<T: DeserializeMessage + Send, Exe: Executor> {
     inner: InnerConsumer<T, Exe>,
 }
 
-impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
+impl<T: DeserializeMessage + Send + 'static, Exe: Executor> Consumer<T, Exe> {
     /// creates a [ConsumerBuilder] from a client instance
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn builder(pulsar: &Pulsar<Exe>) -> ConsumerBuilder<Exe> {
@@ -411,7 +411,7 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
 }
 
 //TODO: why does T need to be 'static?
-impl<T: DeserializeMessage + 'static, Exe: Executor> Stream for Consumer<T, Exe> {
+impl<T: DeserializeMessage + Send + 'static, Exe: Executor> Stream for Consumer<T, Exe> {
     type Item = Result<Message<T>, Error>;
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -495,7 +495,7 @@ mod tests {
         dur: Duration,
     ) -> Result<Message<T>, String>
     where
-        T: DeserializeMessage + 'static,
+        T: DeserializeMessage + Send + 'static,
     {
         match tokio::time::timeout(dur, c.next()).await {
             Err(_) => Err(format!("timed out waiting for next() after {:?}", dur)),
@@ -1529,7 +1529,7 @@ mod tests {
     }
 
     /// Build an Exclusive consumer that starts from Earliest.
-    async fn earliest_consumer<T: DeserializeMessage>(
+    async fn earliest_consumer<T: DeserializeMessage + Send + 'static>(
         client: &Pulsar<TokioExecutor>,
         topic: &str,
         name: &str,

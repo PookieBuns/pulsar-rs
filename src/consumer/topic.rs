@@ -19,7 +19,7 @@ use crate::{
     connection::Connection,
     consumer::{
         config::ConsumerConfig,
-        data::{DeadLetterPolicy, EngineMessage, MessageData, MessageIdDataReceiver},
+        data::{DeadLetterPolicy, DecodedMessageReceiver, EngineMessage, MessageData},
         engine::ConsumerEngine,
         message::Message,
     },
@@ -31,11 +31,11 @@ use crate::{
 };
 
 // this is entirely public for use in reader.rs
-pub struct TopicConsumer<T: DeserializeMessage, Exe: Executor> {
+pub struct TopicConsumer<T: DeserializeMessage + Send, Exe: Executor> {
     pub(crate) consumer_id: u64,
     pub(crate) config: ConsumerConfig,
     topic: String,
-    messages: Pin<Box<MessageIdDataReceiver>>,
+    messages: Pin<Box<DecodedMessageReceiver<T>>>,
     engine_tx: mpsc::UnboundedSender<EngineMessage<Exe>>,
     data_type: PhantomData<fn(Payload) -> T::Output>,
     pub(crate) dead_letter_policy: Option<DeadLetterPolicy>,
@@ -43,7 +43,7 @@ pub struct TopicConsumer<T: DeserializeMessage, Exe: Executor> {
     pub(super) messages_received: u64,
 }
 
-impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
+impl<T: DeserializeMessage + Send + 'static, Exe: Executor> TopicConsumer<T, Exe> {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub(super) async fn new(
         client: Pulsar<Exe>,
@@ -132,11 +132,32 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             return Err(Error::Executor);
         }
 
+        // Create the decoded channel (unified type for both schema and no-schema paths)
+        let (decoded_tx, decoded_rx) =
+            mpsc::channel::<Result<(MessageIdData, Payload, Option<T>), Error>>(
+                receiver_queue_size as usize,
+            );
+
+        // Pass-through adapter: converts (id, payload) -> (id, payload, None)
+        let adapter_task = client.executor.spawn(Box::pin(async move {
+            let mut raw_rx = rx;
+            let mut decoded_tx = decoded_tx;
+            while let Some(result) = raw_rx.next().await {
+                let mapped = result.map(|(id, payload)| (id, payload, None));
+                if decoded_tx.send(mapped).await.is_err() {
+                    break;
+                }
+            }
+        }));
+        if adapter_task.is_err() {
+            return Err(Error::Executor);
+        }
+
         Ok(TopicConsumer {
             consumer_id,
             config,
             topic,
-            messages: Box::pin(rx),
+            messages: Box::pin(decoded_rx),
             engine_tx,
             data_type: PhantomData,
             dead_letter_policy,
@@ -295,7 +316,12 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    fn create_message(&self, message_id: MessageIdData, payload: Payload) -> Message<T> {
+    fn create_message(
+        &self,
+        message_id: MessageIdData,
+        payload: Payload,
+        decoded: Option<T>,
+    ) -> Message<T> {
         Message {
             topic: self.topic.clone(),
             message_id: MessageData {
@@ -303,7 +329,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
                 batch_size: payload.metadata.num_messages_in_batch,
             },
             payload,
-            decoded: None,
+            decoded,
         }
     }
 
@@ -318,7 +344,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
     }
 }
 
-impl<T: DeserializeMessage, Exe: Executor> Stream for TopicConsumer<T, Exe> {
+impl<T: DeserializeMessage + Send + 'static, Exe: Executor> Stream for TopicConsumer<T, Exe> {
     type Item = Result<Message<T>, Error>;
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -326,10 +352,10 @@ impl<T: DeserializeMessage, Exe: Executor> Stream for TopicConsumer<T, Exe> {
         match self.messages.as_mut().poll_next(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(None),
-            Poll::Ready(Some(Ok((id, payload)))) => {
+            Poll::Ready(Some(Ok((id, payload, decoded)))) => {
                 self.last_message_received = Some(Utc::now());
                 self.messages_received += 1;
-                Poll::Ready(Some(Ok(self.create_message(id, payload))))
+                Poll::Ready(Some(Ok(self.create_message(id, payload, decoded))))
             }
             Poll::Ready(Some(Err(e))) => {
                 error!("we are using in the single-consumer and we got an error, {e}");
