@@ -1634,7 +1634,6 @@ pub(crate) mod messages {
                 close_producer: Some(proto::CommandCloseProducer {
                     producer_id,
                     request_id,
-                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -1755,7 +1754,6 @@ pub(crate) mod messages {
                 close_consumer: Some(proto::CommandCloseConsumer {
                     consumer_id,
                     request_id,
-                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -1793,7 +1791,6 @@ pub(crate) mod messages {
                 unsubscribe: Some(proto::CommandUnsubscribe {
                     consumer_id,
                     request_id,
-                    ..Default::default()
                 }),
                 ..Default::default()
             },
