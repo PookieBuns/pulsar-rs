@@ -1,5 +1,6 @@
 //! Message publication
 use std::{
+    any::Any,
     collections::{btree_map::Entry, BTreeMap, HashMap, VecDeque},
     io::Write,
     pin::Pin,
@@ -86,6 +87,9 @@ pub struct Message {
     /// UTC Unix timestamp in milliseconds, time at which the message should be
     /// delivered to consumers
     pub deliver_at_time: ::std::option::Option<i64>,
+    /// Schema ID from external schema registry (PIP-420).
+    /// Written to MessageMetadata.schema_id when present.
+    pub schema_id: Option<Vec<u8>>,
 }
 
 /// internal message type carrying options that must be defined
@@ -118,6 +122,7 @@ pub(crate) struct ProducerMessage {
     /// UTC Unix timestamp in milliseconds, time at which the message should be
     /// delivered to consumers
     pub deliver_at_time: ::std::option::Option<i64>,
+    pub schema_id: Option<Vec<u8>>,
 }
 
 impl From<Message> for ProducerMessage {
@@ -132,6 +137,7 @@ impl From<Message> for ProducerMessage {
             event_time: m.event_time,
             schema_version: m.schema_version,
             deliver_at_time: m.deliver_at_time,
+            schema_id: m.schema_id,
             ..Default::default()
         }
     }
@@ -320,6 +326,10 @@ impl<Exe: Executor> MultiTopicProducer<Exe> {
 /// a producer for a single topic
 pub struct Producer<Exe: Executor> {
     inner: ProducerInner<Exe>,
+    /// Type-erased schema object (`Box<dyn Any>` wrapping `Arc<dyn PulsarSchema<T>>`).
+    /// Cannot call schema.close() here due to type erasure — cleanup happens on Drop.
+    /// External schemas needing async cleanup should manage their own lifecycle.
+    schema_object: Option<Box<dyn Any + Send + Sync>>,
 }
 
 impl<Exe: Executor> Producer<Exe> {
@@ -423,6 +433,61 @@ impl<Exe: Executor> Producer<Exe> {
         &mut self,
         message: T,
     ) -> Result<SendFuture, Error> {
+        let serialized_message = T::serialize_message(message)?;
+        match &mut self.inner {
+            ProducerInner::Single(p) => p.send(serialized_message).await,
+            ProducerInner::Partitioned(p) => {
+                p.choose_partition(&serialized_message)
+                    .send(serialized_message)
+                    .await
+            }
+        }
+    }
+
+    /// Sends a message using the attached PulsarSchema (PIP-420).
+    ///
+    /// When a schema has been registered via [`ProducerBuilder::with_schema`],
+    /// this method calls `PulsarSchema::encode` to obtain the payload and the
+    /// registry `schema_id` before sending.  If the attached schema's type
+    /// parameter does not match `T`, this falls back to `SerializeMessage`.
+    ///
+    /// Use this method (instead of [`send_non_blocking`]) when you want
+    /// schema-aware encoding for messages produced with an external schema
+    /// registry.
+    ///
+    /// The `T: 'static` bound is required for Rust's `Any`-based runtime
+    /// type-checking inside the type-erased schema dispatch.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn send_schema_non_blocking<T: SerializeMessage + Sized + Send + 'static>(
+        &mut self,
+        message: T,
+    ) -> Result<SendFuture, Error> {
+        // Try PulsarSchema<T> if available and the stored schema matches T.
+        if let Some(ref schema_obj) = self.schema_object {
+            if let Some(schema) = schema_obj
+                .downcast_ref::<Arc<dyn crate::schema::PulsarSchema<T>>>()
+            {
+                let topic = self.topic().to_string();
+                let encode_data = schema.encode(&topic, message).await?;
+
+                let serialized_message = Message {
+                    payload: encode_data.payload,
+                    schema_id: encode_data.schema_id,
+                    ..Default::default()
+                };
+
+                return match &mut self.inner {
+                    ProducerInner::Single(p) => p.send(serialized_message).await,
+                    ProducerInner::Partitioned(p) => {
+                        p.choose_partition(&serialized_message)
+                            .send(serialized_message)
+                            .await
+                    }
+                };
+            }
+        }
+
+        // Fallback: use SerializeMessage (no schema attached or type mismatch).
         let serialized_message = T::serialize_message(message)?;
         match &mut self.inner {
             ProducerInner::Single(p) => p.send(serialized_message).await,
@@ -763,7 +828,7 @@ impl<Exe: Executor> TopicProducer<Exe> {
                     },
                     payload: message.payload,
                 };
-                let item = BatchItem::SingleMessage(tx, batched);
+                let item = BatchItem::SingleMessage(tx, batched, message.schema_id);
                 msg_sender.send(item).await.map_err(|e| {
                     Error::Producer(ProducerError::Custom(format!(
                         "failed to send message to batch_process_loop: {e}"
@@ -996,12 +1061,27 @@ impl<Exe: Executor> std::ops::Drop for TopicProducer<Exe> {
 /// Helper structure to prepare a producer
 ///
 /// generated from [Pulsar::producer]
-#[derive(Clone)]
 pub struct ProducerBuilder<Exe: Executor> {
     pulsar: Pulsar<Exe>,
     topic: Option<String>,
     name: Option<String>,
     producer_options: Option<ProducerOptions>,
+    schema_info: Option<Schema>,
+    schema_object: Option<Box<dyn Any + Send + Sync>>,
+}
+
+impl<Exe: Executor> Clone for ProducerBuilder<Exe> {
+    fn clone(&self) -> Self {
+        ProducerBuilder {
+            pulsar: self.pulsar.clone(),
+            topic: self.topic.clone(),
+            name: self.name.clone(),
+            producer_options: self.producer_options.clone(),
+            schema_info: self.schema_info.clone(),
+            // schema_object is NOT cloned — only the original builder carries the schema.
+            schema_object: None,
+        }
+    }
 }
 
 impl<Exe: Executor> ProducerBuilder<Exe> {
@@ -1013,6 +1093,8 @@ impl<Exe: Executor> ProducerBuilder<Exe> {
             topic: None,
             name: None,
             producer_options: None,
+            schema_info: None,
+            schema_object: None,
         }
     }
 
@@ -1037,6 +1119,18 @@ impl<Exe: Executor> ProducerBuilder<Exe> {
         self
     }
 
+    /// Attach an external schema to this producer.
+    /// The schema is type-erased internally; it is downcast back to
+    /// `PulsarSchema<T>` when `send_non_blocking()` is called.
+    pub fn with_schema<T: Send + 'static>(
+        mut self,
+        schema: Arc<dyn crate::schema::PulsarSchema<T>>,
+    ) -> Self {
+        self.schema_info = Some(schema.schema_info());
+        self.schema_object = Some(Box::new(schema));
+        self
+    }
+
     /// creates a new producer
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn build(self) -> Result<Producer<Exe>, Error> {
@@ -1045,9 +1139,14 @@ impl<Exe: Executor> ProducerBuilder<Exe> {
             topic,
             name,
             producer_options,
+            schema_info,
+            schema_object,
         } = self;
         let topic = topic.ok_or_else(|| Error::Custom("topic not set".to_string()))?;
-        let options = producer_options.unwrap_or_default();
+        let mut options = producer_options.unwrap_or_default();
+        if let Some(info) = schema_info {
+            options.schema = Some(info);
+        }
 
         let mut producers: Vec<TopicProducer<Exe>> = try_join_all(
             pulsar
@@ -1085,7 +1184,10 @@ impl<Exe: Executor> ProducerBuilder<Exe> {
             }),
         };
 
-        Ok(Producer { inner: producer })
+        Ok(Producer {
+            inner: producer,
+            schema_object,
+        })
     }
 
     /// creates a new [MultiTopicProducer]
@@ -1111,7 +1213,7 @@ struct BatchStorage {
 impl BatchStorage {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn push_back(&mut self, item: BatchItem) {
-        if let BatchItem::SingleMessage(_, batched_msg) = &item {
+        if let BatchItem::SingleMessage(_, batched_msg, _) = &item {
             self.size += batched_msg.metadata.payload_size as usize;
         }
         self.storage.push_back(item);
@@ -1143,6 +1245,7 @@ enum BatchItem {
     SingleMessage(
         oneshot::Sender<Result<CommandSendReceipt, Error>>,
         BatchedMessage,
+        Option<Vec<u8>>,  // schema_id for PIP-420
     ),
     Flush(oneshot::Sender<()>),
 }
@@ -1196,7 +1299,7 @@ async fn batch_process_loop(
                     warn!("producer {}'s batch_process_loop exits when there are {} messages not flushed",
                         producer_id, count);
                     for item in batch_storage.get_messages() {
-                        if let BatchItem::SingleMessage(tx, _) = item {
+                        if let BatchItem::SingleMessage(tx, _, _) = item {
                             let _ = tx.send(Err(Error::Producer(ProducerError::Closed)));
                         }
                     }
@@ -1256,8 +1359,18 @@ async fn message_send_loop<Exe>(
                     }
                 };
                 let counter = batch_items.len();
+
+                // Extract schema_id from first message (PIP-420: all messages in batch share same schema_id)
+                let batch_schema_id = batch_items.iter().find_map(|item| {
+                    if let BatchItem::SingleMessage(_, _, schema_id) = item {
+                        schema_id.clone()
+                    } else {
+                        None
+                    }
+                });
+
                 for item in batch_items {
-                    if let BatchItem::SingleMessage(tx, batched_msg) = item {
+                    if let BatchItem::SingleMessage(tx, batched_msg, _) = item {
                         receipts.push(tx);
                         batched_msg.serialize(&mut payload);
                     } else {
@@ -1278,6 +1391,7 @@ async fn message_send_loop<Exe>(
                     payload,
                     num_messages_in_batch: Some(counter as i32),
                     schema_version: schema_version.clone(),
+                    schema_id: batch_schema_id,
                     ..Default::default()
                 };
 
@@ -1523,6 +1637,7 @@ mod tests {
             event_time: Some(42),
             schema_version: Some(vec![9, 9]),
             deliver_at_time: Some(123456789),
+            schema_id: None,
         };
 
         let pm: ProducerMessage = m.clone().into();
