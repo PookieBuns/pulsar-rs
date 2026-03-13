@@ -68,7 +68,6 @@ impl Future for SendFuture {
 /// this is actually a subset of the fields of a message, because batching,
 /// compression and encryption should be handled by the producer
 #[derive(Debug, Clone, Default)]
-#[non_exhaustive]
 pub struct Message {
     /// serialized data
     pub payload: Vec<u8>,
@@ -202,7 +201,7 @@ impl ProducerOptions {
 /// # let topic = "topic";
 /// # let message = "data".to_owned();
 /// let pulsar: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await?;
-/// let mut producer = pulsar.producer().with_name("name").build_multi_topic()?;
+/// let mut producer = pulsar.producer().with_name("name").build_multi_topic();
 /// let send_1 = producer.send_non_blocking(topic, &message).await?;
 /// let send_2 = producer.send_non_blocking(topic, &message).await?;
 /// send_1.await?;
@@ -1300,25 +1299,27 @@ impl<Exe: Executor> ProducerBuilder<Exe> {
     /// 2. [`MultiTopicProducer::send_schema_non_blocking`] can encode via the
     ///    attached `PulsarSchema`.
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub fn build_multi_topic(self) -> Result<MultiTopicProducer<Exe>, Error> {
-        if self.schema_info.is_some() && self.schema_object.is_none() {
-            return Err(Error::Custom(
-                "schema_object lost — was build_multi_topic() called on a cloned \
-                 ProducerBuilder? Only the original builder retains the schema."
-                    .to_string(),
-            ));
-        }
+    pub fn build_multi_topic(self) -> MultiTopicProducer<Exe> {
+        // Clone clears both schema_info and schema_object together, so this
+        // state (schema_info present but schema_object missing) should never
+        // occur through normal API usage.
+        debug_assert!(
+            !(self.schema_info.is_some() && self.schema_object.is_none()),
+            "schema_object lost — was build_multi_topic() called on a builder \
+             in an inconsistent state? Only the original (non-cloned) builder \
+             retains the schema."
+        );
         let mut options = self.producer_options.unwrap_or_default();
         if let Some(info) = self.schema_info {
             options.schema = Some(info);
         }
-        Ok(MultiTopicProducer {
+        MultiTopicProducer {
             client: self.pulsar,
             producers: Default::default(),
             options,
             name: self.name,
             schema_object: self.schema_object,
-        })
+        }
     }
 }
 
@@ -2066,8 +2067,7 @@ mod tests {
             let producer = pulsar
                 .producer()
                 .with_schema(schema)
-                .build_multi_topic()
-                .unwrap();
+                .build_multi_topic();
 
             // The schema should have been merged into options.
             assert!(
@@ -2096,8 +2096,7 @@ mod tests {
             let producer = pulsar
                 .producer()
                 .with_schema(schema)
-                .build_multi_topic()
-                .unwrap();
+                .build_multi_topic();
 
             assert!(
                 producer.schema_object.is_some(),
@@ -2115,7 +2114,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let producer = pulsar.producer().build_multi_topic().unwrap();
+            let producer = pulsar.producer().build_multi_topic();
 
             assert!(producer.options().schema.is_none());
             assert!(producer.schema_object.is_none());
@@ -2141,7 +2140,7 @@ mod tests {
             let cloned = builder.clone();
 
             // Original should carry schema:
-            let original = builder.build_multi_topic().unwrap();
+            let original = builder.build_multi_topic();
             assert!(
                 original.options().schema.is_some(),
                 "original should have schema"
@@ -2152,7 +2151,7 @@ mod tests {
             );
 
             // Clone should succeed but without schema:
-            let cloned_producer = cloned.build_multi_topic().unwrap();
+            let cloned_producer = cloned.build_multi_topic();
             assert!(
                 cloned_producer.options().schema.is_none(),
                 "cloned builder should not have schema"
@@ -2181,12 +2180,11 @@ mod tests {
         let mut producer = pulsar
             .producer()
             .with_schema(schema)
-            .build_multi_topic()
-            .unwrap();
+            .build_multi_topic();
 
         // send_schema_non_blocking should encode via PulsarSchema
         let _receipt = producer
-            .send_schema_non_blocking(&topic, "hello-schema".to_string(), None)
+            .send_schema_non_blocking::<String, _>(&topic, "hello-schema".to_string(), None)
             .await
             .unwrap()
             .await
@@ -2248,13 +2246,12 @@ mod tests {
         let mut producer = pulsar
             .producer()
             .with_schema(schema)
-            .build_multi_topic()
-            .unwrap();
+            .build_multi_topic();
 
         // send_schema_non_blocking to a partitioned topic
         for i in 0..6 {
             let _receipt = producer
-                .send_schema_non_blocking(&topic, format!("multi-msg-{i}"), None)
+                .send_schema_non_blocking::<String, _>(&topic, format!("multi-msg-{i}"), None)
                 .await
                 .unwrap()
                 .await
